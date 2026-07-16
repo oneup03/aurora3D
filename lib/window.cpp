@@ -27,6 +27,12 @@ extern "C" void Android_LockActivityMutex(void);
 extern "C" void Android_UnlockActivityMutex(void);
 #endif
 
+#if defined(SDL_PLATFORM_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <vector>
@@ -81,7 +87,51 @@ Vec2<int> fit_frame_buffer_to_aspect(int width, int height, float aspect) {
   return {width, std::max(1, static_cast<int>(std::lround(static_cast<float>(width) / aspect)))};
 }
 
+#if defined(SDL_PLATFORM_WIN32)
+// A DPI-unaware external window manager (observed: the LeiaSR / SimulatedReality
+// service positioning our window on its display) can SetWindowPos this window
+// using virtualized coordinates. Windows scales that request by the monitor's
+// DPI factor, inflating a fullscreen window to displaySize * dpiScale — larger
+// than the screen — so only the top-left portion is visible (image zoomed and
+// cropped by the DPI factor) and the SR weave no longer lands 1:1 on panel
+// pixels. Detect the oversize from our per-monitor-DPI-aware context and
+// re-assert the true display bounds. Returns true if a correction was issued
+// (a follow-up resize event will re-enter resize_swapchain with sane values).
+bool fix_dpi_unaware_external_resize() noexcept {
+  if (g_window == nullptr || (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) == 0) {
+    return false;
+  }
+  const SDL_DisplayID display = SDL_GetDisplayForWindow(g_window);
+  SDL_Rect bounds{};
+  if (display == 0 || !SDL_GetDisplayBounds(display, &bounds) || bounds.w <= 0 || bounds.h <= 0) {
+    return false;
+  }
+  int w = 0;
+  int h = 0;
+  if (!SDL_GetWindowSize(g_window, &w, &h) || (w <= bounds.w && h <= bounds.h)) {
+    return false;
+  }
+  Log.warn("Fullscreen window ({}x{}) exceeds display bounds ({}x{}); re-asserting size "
+           "(DPI-unaware external resize?)",
+           w, h, bounds.w, bounds.h);
+  auto* hwnd = static_cast<HWND>(
+      SDL_GetPointerProperty(SDL_GetWindowProperties(g_window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+  if (hwnd == nullptr) {
+    return false;
+  }
+  SetWindowPos(hwnd, nullptr, bounds.x, bounds.y, bounds.w, bounds.h, SWP_NOZORDER | SWP_NOACTIVATE);
+  return true;
+}
+#endif
+
 void resize_swapchain() noexcept {
+#if defined(SDL_PLATFORM_WIN32)
+  if (fix_dpi_unaware_external_resize()) {
+    // Skip this pass; the correction generates a new resize event and we'll
+    // reconfigure the swapchain from the corrected size.
+    return;
+  }
+#endif
   const auto size = get_window_size();
   if (size == g_windowSize) {
     return;
