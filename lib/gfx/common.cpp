@@ -457,15 +457,19 @@ static void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false
 }
 
 static void set_efb_targets(RenderPass& pass) {
-  pass.colorView = webgpu::g_frameBuffer.view;
-  pass.resolveView = webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : nullptr;
-  pass.depthStencilView = webgpu::g_depthBuffer.view;
+  const bool right = webgpu::g_activeEye == AURORA_EYE_RIGHT;
+  auto& color = right ? webgpu::g_frameBufferRight : webgpu::g_frameBuffer;
+  auto& resolved = right ? webgpu::g_frameBufferResolvedRight : webgpu::g_frameBufferResolved;
+  auto& depth = right ? webgpu::g_depthBufferRight : webgpu::g_depthBuffer;
+  pass.colorView = color.view;
+  pass.resolveView = webgpu::g_graphicsConfig.msaaSamples > 1 ? resolved.view : nullptr;
+  pass.depthStencilView = depth.view;
   pass.copySourceTexture =
-      webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.texture : webgpu::g_frameBuffer.texture;
+      webgpu::g_graphicsConfig.msaaSamples > 1 ? resolved.texture : color.texture;
   pass.copySourceView =
-      webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : webgpu::g_frameBuffer.view;
-  pass.copySourceDepthView = webgpu::g_depthBuffer.view;
-  pass.targetSize = webgpu::g_frameBuffer.size;
+      webgpu::g_graphicsConfig.msaaSamples > 1 ? resolved.view : color.view;
+  pass.copySourceDepthView = depth.view;
+  pass.targetSize = color.size;
   pass.msaaSamples = webgpu::g_graphicsConfig.msaaSamples;
   pass.hasDepth = true;
   pass.hasStencil = false;
@@ -1091,6 +1095,23 @@ void begin_offscreen(uint32_t width, uint32_t height) {
 
   g_cachedViewport = {0.f, 0.f, static_cast<float>(width), static_cast<float>(height), 0.f, 1.f};
   g_cachedScissor = {0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)};
+  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
+  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
+}
+
+void begin_new_efb_pass_for_active_eye() {
+  ZoneScoped;
+  if (g_currentRenderPass == UINT32_MAX) {
+    // Between frames; the next begin_frame will pick up the new active eye.
+    return;
+  }
+  if (g_inOffscreen) {
+    Log.warn("begin_new_efb_pass_for_active_eye called during offscreen rendering; ignoring");
+    return;
+  }
+  g_renderPasses.emplace_back();
+  ++g_currentRenderPass;
+  set_efb_targets(g_renderPasses[g_currentRenderPass]);
   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
 }

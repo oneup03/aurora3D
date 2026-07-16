@@ -106,6 +106,19 @@ void GXLoadTexMtxImm(const void* mtx_, u32 id, GXTexMtxType type) {
   GX_WRITE_U8(0x10);
   GX_WRITE_U32(reg);
 
+  // TPHD-3D style per-vertex stereo correction. When dusklight wraps a draw
+  // with aurora_set_stereo_texgen_correction(true), any 3x4 tex matrix that
+  // looks like a projection-derived screen-space transform gets a
+  // depth-dependent shift applied to its first row.
+  //
+  // For a matrix where row 2 is (..., ..., gz, gh) with gz != 0 (perspective
+  // q row), the resulting u after divide is s_old/q + delta where
+  //   delta = -eyeOffsetX * (1/q - 1/conv) * M[0][0]
+  // i.e. zero at the convergence plane, growing as 1/depth. Bake this into
+  // the matrix via row-1 modifications:
+  //   M[0][3] += -eyeOffsetX * M[0][0]                  (1/q term)
+  //   M[0][2] += -eyeOffsetX * M[0][0] / convergence    (1/conv term, via M[2])
+  // (Derivation in dusk/stereo: s_new = s_old + delta * q, expanded in pos.)
   const auto* mtx = reinterpret_cast<const f32*>(mtx_);
   for (u32 i = 0; i < count; i++) {
     GX_WRITE_F32(mtx[i]);

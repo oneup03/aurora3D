@@ -47,9 +47,16 @@ extern GraphicsConfig g_graphicsConfig;
 extern TextureWithSampler g_frameBuffer;
 extern TextureWithSampler g_frameBufferResolved;
 extern TextureWithSampler g_depthBuffer;
+extern TextureWithSampler g_frameBufferRight;
+extern TextureWithSampler g_frameBufferResolvedRight;
+extern TextureWithSampler g_depthBufferRight;
 extern wgpu::RenderPipeline g_CopyPipeline;
 extern wgpu::RenderPipeline g_CopyPremultipliedAlphaPipeline;
 extern wgpu::BindGroup g_CopyBindGroup;
+extern wgpu::RenderPipeline g_UIOverlayPipeline;
+extern wgpu::Buffer g_StereoUbo;
+extern AuroraStereoConfig g_stereoCfg;
+extern AuroraEye g_activeEye;
 extern wgpu::Instance g_instance;
 extern wgpu::AdapterInfo g_adapterInfo;
 extern bool g_hasCoreFeatures;
@@ -64,12 +71,17 @@ bool refresh_surface(bool recreate = true);
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force = false);
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled);
 const TextureWithSampler& present_source() noexcept;
+const TextureWithSampler& present_source_for(AuroraEye eye) noexcept;
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source);
+wgpu::BindGroup create_copy_bind_group_stereo(const TextureWithSampler& left, const TextureWithSampler& right);
+wgpu::BindGroup create_ui_overlay_bind_group(const TextureWithSampler& uiTexture);
 void set_resampler(AuroraSampler sampler) noexcept;
 AuroraSampler get_resampler() noexcept;
 Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_height, uint32_t content_width,
                                     uint32_t content_height) noexcept;
 const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& encoder, const Viewport& viewport);
+const TextureWithSampler& resample_present_source_for(const wgpu::CommandEncoder& encoder, const Viewport& viewport,
+                                                      AuroraEye eye);
 void draw_clear(const wgpu::RenderPassEncoder& pass, bool clearColor, bool clearAlpha, bool clearDepth,
                 const Vec4<float>& clearColorValue, float clearDepthValue);
 

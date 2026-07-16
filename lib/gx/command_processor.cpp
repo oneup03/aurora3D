@@ -2,6 +2,8 @@
 
 #include "../gfx/common.hpp"
 #include "../gfx/depth_peek.hpp"
+#include "../gfx/texture_replacement.hpp"
+#include "../webgpu/gpu.hpp"
 #include "dolphin/gx/GXAurora.h"
 #include "gx.hpp"
 #include "gx_fmt.hpp"
@@ -301,6 +303,48 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     f32* flat = reinterpret_cast<f32*>(&mtx);
     for (u32 i = 0; i < len; i++) {
       flat[startOffset + i] = read_f32(data + i * 4, bigEndian);
+    }
+    // Stereo correction for the Ordon Village river's projection-style
+    // PTTEXMTX[0]. The matrix is written here via paths that bypass J3D's
+    // calcPostTexMtx dispatchers (likely BMD embedded display lists), so
+    // it can't be intercepted upstream. We apply the same asymmetric
+    // formula that the painter-funnel uses for Faron/Ordon Spring water
+    // (apply_reflection_correction_to in dusk/stereo.cpp): a depth-
+    // dependent shift on row 0 keyed off the current eye.
+    //
+    // Tight q-row check ensures only the water-reflection style matrix
+    // (q = (0, 0, -1, 0) exactly) gets touched. Shadow projections, env
+    // maps, and other PTTEXMTX-using texgens are left alone.
+    //
+    // NOTE: Lakebed Temple / Lake Hylia / Zora's Domain / Goron Hot
+    // Spring water surfaces have a different problem -- they use TexMtx0
+    // (postex_mtx[10] in the UBO) with a non-standard q row rather than
+    // PTTEXMTX[0], so this fix doesn't reach them. See
+    // project_river_reflection_next_steps.md.
+    if (mtxIdx == 0 && webgpu::g_stereoCfg.mode != AURORA_STEREO_OFF) {
+      const f32 q_x = flat[2 * 4 + 0];
+      const f32 q_y = flat[2 * 4 + 1];
+      const f32 q_z = flat[2 * 4 + 2];
+      const f32 q_w = flat[2 * 4 + 3];
+      if (std::abs(q_x) < 0.01f && std::abs(q_y) < 0.01f
+          && q_z > -1.01f && q_z < -0.99f
+          && std::abs(q_w) < 0.001f) {
+        const f32 separation = webgpu::g_stereoCfg.eyeSeparation;
+        const f32 convergence = webgpu::g_stereoCfg.convergence;
+        if (convergence > 0.0001f) {
+          const f32 halfSep = separation * 0.5f;
+          // Sign opposite of apply_reflection_correction_to in dusk/stereo.cpp:
+          // we're modifying the final composed PTTEXMTX[0] here, not the
+          // pre-composition EffectMtx, so the formula's sign inverts.
+          //
+          // Asymmetric depth term only -- the constShift term from the
+          // Faron Spring formula over-shifts here because the geometry
+          // already gets its per-eye camera shift from push_eye_offset.
+          const f32 depthShift = (webgpu::g_activeEye == AURORA_EYE_LEFT) ? -halfSep : 2.0f * halfSep;
+          const f32 m00 = flat[0];
+          flat[0 * 4 + 3] += depthShift * m00;
+        }
+      }
     }
     g_gxState.stateDirty = true;
     return true;
@@ -1016,9 +1060,28 @@ static void handle_bp(u32 value, bool bigEndian) {
     if (col1 & 0x400)
       col1 |= ~0x7FF;
 
+    // Stereo-only amplitude scale: shrink the indirect-texture distortion
+    // when stereo is active. Screen-space refraction (heat haze, water,
+    // overlay distortion) sits at one depth while the sampled FB pixels
+    // come from varying depths behind it -- the depth mismatch reads as
+    // vergence-accommodation conflict / eye strain in 3D. This is the
+    // single chokepoint for both BP-write paths (GXSetIndTexMtx packs into
+    // the same registers, J3DGDSetIndTexMtx writes them directly), so all
+    // J3D / JPA / per-particle-callback refraction passes are covered.
+    // Treated as 1.0 in mono so non-stereo rendering is unaffected.
+    f32 ampScale = 1.0f;
+    if (webgpu::g_stereoCfg.mode != AURORA_STEREO_OFF) {
+      ampScale = webgpu::g_stereoCfg.refractionAmplitudeScale;
+      if (ampScale < 0.0f) {
+        ampScale = 0.0f;
+      } else if (ampScale > 1.0f) {
+        ampScale = 1.0f;
+      }
+    }
+
     auto& packedColumn = column == 0 ? info.mtx.m0 : (column == 1 ? info.mtx.m1 : info.mtx.m2);
-    packedColumn.x = static_cast<float>(col0) / 1024.0f;
-    packedColumn.y = static_cast<float>(col1) / 1024.0f;
+    packedColumn.x = static_cast<float>(col0) / 1024.0f * ampScale;
+    packedColumn.y = static_cast<float>(col1) / 1024.0f * ampScale;
 
     // Accumulate the indirect matrix scale exponent. The SDK writes two bits per column, but
     // the hardware appears to ignore the top bit from the third column, leaving an effective

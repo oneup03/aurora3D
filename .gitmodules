@@ -1,0 +1,3 @@
+[submodule "extern/leiasr"]
+	path = extern/leiasr
+	url = https://github.com/oneup03/LeiaSR64.git

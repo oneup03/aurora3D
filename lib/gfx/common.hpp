@@ -263,6 +263,12 @@ bool is_offscreen() noexcept;
 uint32_t get_sample_count() noexcept;
 void clear_caches() noexcept;
 
+// Stereo: start a fresh EFB render pass for the current `webgpu::g_activeEye`.
+// Caller is responsible for draining the GX FIFO before invoking. Safe to call
+// only between frames-active when an EFB pass is current (i.e. not while
+// inside offscreen rendering).
+void begin_new_efb_pass_for_active_eye();
+
 namespace tex_palette_conv {
 struct ConvRequest;
 } // namespace tex_palette_conv

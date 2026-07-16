@@ -135,11 +135,34 @@ MappedPoint map_native_point_to_content(float nativeX, float nativeY) noexcept {
     return {};
   }
 
+  // In stereo modes that compress the UI into half the viewport (SbS / TaB),
+  // both halves show the same UI scaled 0.5x. Map a pointer in either half
+  // back to the same full-resolution content coordinate so clicks and scrolls
+  // hit the element under the cursor in whichever half the user is using.
+  float adjustedX = nativeX;
+  float adjustedY = nativeY;
+  switch (webgpu::g_stereoCfg.mode) {
+  case AURORA_STEREO_SBS: {
+    const float halfW = viewport.width * 0.5f;
+    const float localX = nativeX - viewport.left;
+    adjustedX = viewport.left + (localX < halfW ? localX * 2.0f : (localX - halfW) * 2.0f);
+    break;
+  }
+  case AURORA_STEREO_TAB: {
+    const float halfH = viewport.height * 0.5f;
+    const float localY = nativeY - viewport.top;
+    adjustedY = viewport.top + (localY < halfH ? localY * 2.0f : (localY - halfH) * 2.0f);
+    break;
+  }
+  default:
+    break;
+  }
+
   return {
       .position =
           {
-              (nativeX - viewport.left) * static_cast<float>(contentSize.x) / viewport.width,
-              (nativeY - viewport.top) * static_cast<float>(contentSize.y) / viewport.height,
+              (adjustedX - viewport.left) * static_cast<float>(contentSize.x) / viewport.width,
+              (adjustedY - viewport.top) * static_cast<float>(contentSize.y) / viewport.height,
           },
       .valid = true,
       .inside = nativeX >= viewport.left && nativeY >= viewport.top && nativeX < right && nativeY < bottom,
@@ -449,7 +472,11 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
 
   sync_context_metrics(dim);
   g_context->Update();
-  const bool needsBackdrop = context_has_visible_backdrop_filter(g_context);
+  // In stereo the scene seed (present_source) is a single eye, so backdrop
+  // compositing would present a mono image. Force the transparent/overlay
+  // path so the UI-only texture is alpha-blended over the stereo composite.
+  const bool stereoActive = webgpu::g_stereoCfg.mode != AURORA_STEREO_OFF;
+  const bool needsBackdrop = !stereoActive && context_has_visible_backdrop_filter(g_context);
 
   auto* renderInterface = get_render_interface();
   renderInterface->SetWindowSize(g_context->GetDimensions());
@@ -466,6 +493,7 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
   }
   return {
       .bindGroup = s_renderTargetCopyBindGroup,
+      .overlayBindGroup = webgpu::create_ui_overlay_bind_group(s_renderTarget),
       .overlay = !needsBackdrop,
   };
 }

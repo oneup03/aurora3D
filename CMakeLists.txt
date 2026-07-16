@@ -13,6 +13,27 @@ option(AURORA_ENABLE_CARD "Enable CARD implementation based on kabufuda" ON)
 option(AURORA_ENABLE_RMLUI "Enable HTML/CSS Based UI Library for use in end-user UI development." OFF)
 option(AURORA_CACHE_USE_ZSTD "Compress WebGPU cache entries with zstd" ON)
 
+# LeiaSR autostereoscopic weaving (Windows + D3D12 backend only).
+# Vendored at extern/leiasr; overridable via LEIASR_SDKROOT (env var wins).
+# Re-derived every configure so a stale cache (e.g. after moving the submodule)
+# doesn't strand us pointing at a path that no longer exists.
+set(_leiasr_env "$ENV{LEIASR_SDKROOT}")
+set(_leiasr_vendored "${CMAKE_CURRENT_SOURCE_DIR}/extern/leiasr")
+set(_leiasr_resolved "")
+if (WIN32)
+  if (_leiasr_env AND EXISTS "${_leiasr_env}/lib/cmake")
+    set(_leiasr_resolved "${_leiasr_env}")
+  elseif (EXISTS "${_leiasr_vendored}/lib/cmake")
+    set(_leiasr_resolved "${_leiasr_vendored}")
+  endif ()
+endif ()
+set(LEIASR_SDKROOT "${_leiasr_resolved}" CACHE PATH "Path to LeiaSR / Simulated Reality SDK root" FORCE)
+set(AURORA_ENABLE_LEIASR OFF)
+if (LEIASR_SDKROOT)
+  set(AURORA_ENABLE_LEIASR ON)
+  message(STATUS "aurora: LeiaSR enabled (${LEIASR_SDKROOT})")
+endif ()
+
 # Dependency versions
 include(cmake/AuroraDependencyVersions.cmake)
 

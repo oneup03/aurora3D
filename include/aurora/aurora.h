@@ -140,6 +140,43 @@ void aurora_set_resampler(AuroraSampler sampler);
 AuroraBackend aurora_get_backend();
 const AuroraBackend* aurora_get_available_backends(size_t* count);
 
+typedef enum {
+  AURORA_STEREO_OFF = 0,
+  AURORA_STEREO_SBS,
+  AURORA_STEREO_TAB,
+  AURORA_STEREO_ROW_INTERLACED,
+  AURORA_STEREO_COL_INTERLACED,
+  AURORA_STEREO_CHECKERBOARD,
+  AURORA_STEREO_ANAGLYPH,
+  AURORA_STEREO_LEIASR,
+} AuroraStereoMode;
+
+typedef struct {
+  AuroraStereoMode mode;
+  float eyeSeparation;
+  float convergence;
+  float hudDepth;
+  // Multiplier applied to all GX indirect-texture matrices (heat haze,
+  // refraction overlays, water distortion). Screen-space refraction creates
+  // vergence-accommodation conflict in stereo because the distorting surface
+  // sits at one depth while the sampled pixels come from varying depths
+  // behind it. Lower values soften the effect; 0 disables it. Only applied
+  // when mode != AURORA_STEREO_OFF. Set to 1.0 for unchanged behavior --
+  // callers building this struct with aggregate init must include this
+  // field, otherwise it zero-initializes to a flat refraction.
+  float refractionAmplitudeScale;
+} AuroraStereoConfig;
+
+typedef enum {
+  AURORA_EYE_LEFT = 0,
+  AURORA_EYE_RIGHT = 1,
+} AuroraEye;
+
+void aurora_set_stereo_config(const AuroraStereoConfig* cfg);
+void aurora_set_active_eye(AuroraEye eye);
+AuroraEye aurora_get_active_eye();
+bool aurora_stereo_mode_supported(AuroraStereoMode mode);
+
 #ifdef __cplusplus
 }
 #endif

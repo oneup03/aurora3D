@@ -11,6 +11,9 @@ namespace aurora::rmlui {
 
 struct RecordedFrame {
   wgpu::BindGroup bindGroup;
+  // Bind group for webgpu::g_UIOverlayPipeline (stereo-aware UI blit); only
+  // meaningful when `overlay` is true.
+  wgpu::BindGroup overlayBindGroup;
   bool overlay = false;
 };
 
