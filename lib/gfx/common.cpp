@@ -1109,9 +1109,14 @@ void begin_new_efb_pass_for_active_eye() {
     Log.warn("begin_new_efb_pass_for_active_eye called during offscreen rendering; ignoring");
     return;
   }
-  g_renderPasses.emplace_back();
+  // Seal and hand off the current pass, then open a fresh EFB pass targeting
+  // the newly active eye's buffers (set_efb_targets reads g_activeEye).
+  enqueue_pass(current_frame_packet(), g_recordingFrameSlot, g_currentRenderPass);
+  auto& newPass = current_render_passes().emplace_back();
+  newPass.label = pass_label("EFB");
+  newPass.commands.reserve(2048);
   ++g_currentRenderPass;
-  set_efb_targets(g_renderPasses[g_currentRenderPass]);
+  set_efb_targets(current_render_passes()[g_currentRenderPass]);
   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
 }
