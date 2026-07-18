@@ -157,6 +157,16 @@ bool dawn_is_ready() noexcept {
   return g_device != nullptr && g_backendType == wgpu::BackendType::D3D12;
 }
 
+// RENDER-WORKER-THREAD ONLY. Runs SRContext::create / CreateDX12Weaver /
+// SRContext::initialize, which take Dawn's shared D3D12 device+queue and let
+// the SR runtime take over + resize the host window (it re-enters the window
+// proc via SendMessage during initialize()). Calling this from the UI/main
+// thread deadlocks: that thread owns the message pump, and if it's blocked
+// here inside a settings-apply the SR window messages can never be serviced --
+// an unbounded SR window-proc recursion (observed live in the debugger). It is
+// reached only from is_supported()/ensure_ready() on the present path; the
+// UI-thread callers were rerouted to is_runtime_installed(). Do not add a
+// UI-thread caller.
 bool try_init() {
   if (g_state != State::Uninit) {
     return g_state == State::Ready;
@@ -442,6 +452,12 @@ bool is_supported() {
     try_init();
   }
   return g_state == State::Ready;
+}
+
+bool is_runtime_installed() {
+  // DLL-presence probe only -- no SRContext, no weaver, no window takeover, so
+  // this is safe on the UI/main thread (unlike is_supported()/try_init()).
+  return sr_runtime_dlls_available();
 }
 
 bool ensure_ready(uint32_t width, uint32_t height, wgpu::TextureFormat format) {

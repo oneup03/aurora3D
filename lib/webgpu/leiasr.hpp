@@ -24,7 +24,28 @@ namespace aurora::webgpu::leiasr {
 
 // True if the SDK runtime is loaded, an SRContext was created, a Leia display
 // is connected, and the weaver is alive. Lazily initialized on first call.
+//
+// THREADING CONTRACT: this drives the heavyweight, NON-thread-safe SR init
+// (SRContext::create / CreateDX12Weaver / SRContext::initialize), which grabs
+// Dawn's shared D3D12 device+queue and makes the SR runtime take over / resize
+// the host window. It must be called ONLY from the render worker thread that
+// owns the Dawn device. Never call it (directly or via ensure_ready) from the
+// UI/main thread: that thread owns the window message pump, and the SR
+// runtime's initialize() re-enters the window proc via SendMessage -- calling
+// it from inside the settings-apply (which itself runs inside the pump)
+// deadlocks in an unbounded SR window-proc recursion, and it also races the
+// render worker into a concurrent double-init. For UI-thread "should we offer
+// / keep LeiaSR" decisions use is_runtime_installed() instead.
 bool is_supported();
+
+// Cheap, thread-safe, side-effect-free probe: true if the SR Platform DLLs are
+// installed and loadable (a cached LoadLibraryW only -- does NOT create an
+// SRContext or weaver, and does NOT touch the host window). Safe to call from
+// any thread, including the UI/main thread. A true result means "LeiaSR is
+// worth attempting"; the real weaver + display init happens lazily on the
+// render thread via is_supported(). Use this for settings-UI gating and the
+// stereo-config setter.
+bool is_runtime_installed();
 
 // Ensure the weaver and SbS/woven textures exist at the given size + format.
 // Recreates them on size change. Returns false if anything failed.

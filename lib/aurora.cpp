@@ -404,6 +404,24 @@ void end_frame() noexcept {
             struct StereoUboData monoUbo{0u, viewport.width, viewport.height, 0.0f};
             g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &monoUbo, sizeof(monoUbo));
           }
+        } else if (webgpu::g_stereoCfg.mode == AURORA_STEREO_LEIASR) {
+          // LeiaSR is selected but the weaver isn't available this frame: either
+          // its lazy render-thread init hasn't succeeded yet, or it latched
+          // Disabled (no SR display / SR service down). The stereo UBO was set
+          // to LEIASR above (mode has no branch in the compose shader), so
+          // rewrite it to mono and present a clean 2D (left-eye) image instead
+          // of feeding the shader an unhandled mode. Previously the config
+          // setter force-fell-back to OFF synchronously; that path did the
+          // SR init on the UI thread and deadlocked, so the fallback moved
+          // here where it costs one already-computed resample.
+          struct StereoUboData {
+            uint32_t mode;
+            float w;
+            float h;
+            float hudDepth;
+          } monoUbo{0u, viewport.width, viewport.height, 0.0f};
+          g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &monoUbo, sizeof(monoUbo));
+          presentBindGroup = webgpu::create_copy_bind_group(leftResampled);
         }
 #endif
       }
@@ -573,6 +591,13 @@ void aurora_set_stereo_config(const AuroraStereoConfig* cfg) {
     return;
   }
   aurora::webgpu::g_stereoCfg = *cfg;
+  // Runs on the UI/main thread. aurora_stereo_mode_supported(LEIASR) is now a
+  // cheap DLL-presence probe -- it must NOT trigger the real SR weaver init
+  // here (that deadlocks; see leiasr::try_init). If the LeiaSR Platform DLLs
+  // aren't installed we fall back to OFF now; if they are, we keep LEIASR and
+  // the render worker lazily inits the weaver on the present path, falling back
+  // to a mono compose for as long as the weaver isn't actually ready (e.g. no
+  // SR display connected).
   if (!aurora_stereo_mode_supported(aurora::webgpu::g_stereoCfg.mode)) {
     aurora::webgpu::g_stereoCfg.mode = AURORA_STEREO_OFF;
   }
@@ -614,7 +639,13 @@ bool aurora_stereo_mode_supported(AuroraStereoMode mode) {
     return true;
   case AURORA_STEREO_LEIASR:
 #if defined(AURORA_ENABLE_LEIASR) && defined(AURORA_ENABLE_GX)
-    return aurora::webgpu::leiasr::is_supported();
+    // Cheap DLL-presence probe ONLY. This function is called from the UI/main
+    // thread (settings dropdown gating + aurora_set_stereo_config below), where
+    // the heavyweight is_supported()/try_init() path must never run -- it
+    // deadlocks the SR runtime's window-proc re-entrancy and races the render
+    // worker's own lazy init. The real weaver/display init happens on the
+    // render thread via the present path (see leiasr::try_init's contract).
+    return aurora::webgpu::leiasr::is_runtime_installed();
 #else
     return false;
 #endif
