@@ -69,12 +69,16 @@ if (AURORA_ENABLE_GX)
     endif ()
     target_link_libraries(aurora_core PRIVATE dawn::webgpu_dawn)
     if (AURORA_ENABLE_LEIASR)
-        list(APPEND CMAKE_PREFIX_PATH "${LEIASR_SDKROOT}/lib/cmake")
-        find_package(simulatedreality REQUIRED)
-        find_package(srDirectX REQUIRED)
+        # SRLib::SR carries the SDK include dirs, every import library, and
+        # SR.cpp's SRInterfaceDX12 wrapper -- which owns the SRContext/weaver
+        # lifecycle (create -> CreateDX12Weaver -> initialize, in that order) and
+        # the delay-load DLL probing. See extern/SR-lib and the LeiaSR block in
+        # the top-level CMakeLists. Delay-load is applied to the final executable
+        # by the consumer via srlib_apply_delayload(), not here: /DELAYLOAD
+        # cannot be baked into a static library.
         target_compile_definitions(aurora_core PRIVATE AURORA_ENABLE_LEIASR)
         target_sources(aurora_core PRIVATE lib/webgpu/leiasr.cpp lib/webgpu/leiasr.hpp)
-        target_link_libraries(aurora_core PRIVATE simulatedreality srDirectX::srDirectX d3d12.lib dxgi.lib)
+        target_link_libraries(aurora_core PRIVATE SRLib::SR d3d12.lib dxgi.lib)
     endif ()
     if (DAWN_ENABLE_VULKAN)
         target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_VULKAN)

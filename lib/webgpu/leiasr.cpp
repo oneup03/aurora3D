@@ -17,9 +17,17 @@
 #include "../logging.hpp"
 #include "../window.hpp"
 
-#include "sr/management/srcontext.h"
-#include "sr/weaver/dx12weaver.h"
-#include "sr/weaver/WeaverTypes.h"
+// SR-lib's wrapper (extern/SR-lib, bo3b/SR-lib api_expansion) rather than the
+// raw SDK headers. It owns the SRContext + IDX12Weaver1 lifetime, performs
+// create -> CreateDX12Weaver -> initialize() in the one order that makes eye
+// tracking engage, pairs SRContext::create() with deleteSRContext() (the object
+// lives in the SR DLL, so `delete` puts it on the wrong heap), reads the input
+// texture's dimensions and format off its resource desc so the weaver can never
+// be told a size it doesn't have, probes the delay-loaded SR DLLs before
+// touching any SDK entry point, and converts the SDK's exceptions -- notably
+// ServerNotAvailableException when the SR service isn't running -- into an
+// HRESULT.
+#include "SR.hpp"
 
 #include <SDL3/SDL_system.h>
 #include <SDL3/SDL_video.h>
@@ -41,11 +49,11 @@ using Microsoft::WRL::ComPtr;
 enum class State { Uninit, Ready, Disabled };
 State g_state = State::Uninit;
 
-// SR objects. Using IDX12Weaver1 (the non-deprecated interface): output goes
-// to whatever render target is bound on the command list at weave() time, so
-// we bind the woven RTV ourselves and don't pass an output buffer to the SDK.
-SR::SRContext* g_srContext = nullptr;
-SR::IDX12Weaver1* g_weaver = nullptr;
+// SR-lib's DX12 interface. It wraps IDX12Weaver1 (the non-deprecated weaver):
+// output goes to whatever render target is bound on the command list at weave()
+// time, so we bind the woven RTV ourselves and don't pass an output buffer to
+// the SDK. Released with Delete(), never `delete`.
+SimulatedReality::SRInterfaceDX12* g_sr = nullptr;
 
 // Native D3D12 handles (shared with Dawn).
 ComPtr<ID3D12Device> g_d3dDevice;
@@ -76,14 +84,16 @@ HWND g_hwnd = nullptr;
 bool g_sbsInDawnAccess = false;
 bool g_wovenInDawnAccess = false;
 
-// Last (resource, width, height, format) tuple pushed to the weaver via
-// setInputViewTexture. The call isn't free -- it tells the weaver to rebind
-// its sampling source -- so skip it when nothing changed. Cleared by
+// Last resource pushed to the weaver via SetInputTexture, and last format
+// pushed via SetOutputFormat. Neither call is free -- the first tells the
+// weaver to rebind its sampling source -- so skip them when nothing changed.
+// The resource pointer alone is enough to key the input now that SR-lib reads
+// width/height/format off the resource desc: a size or format change here
+// always goes through release_d3d_resources() + a fresh CreateCommittedResource,
+// so a different geometry implies a different pointer. Both are cleared by
 // release_d3d_resources() so a fresh allocation re-pushes.
 ID3D12Resource* g_lastWeaverInputResource = nullptr;
-uint32_t g_lastWeaverInputWidth = 0;
-uint32_t g_lastWeaverInputHeight = 0;
-DXGI_FORMAT g_lastWeaverInputFormat = DXGI_FORMAT_UNKNOWN;
+DXGI_FORMAT g_lastWeaverOutputFormat = DXGI_FORMAT_UNKNOWN;
 
 DXGI_FORMAT to_dxgi_format(wgpu::TextureFormat fmt) noexcept {
   switch (fmt) {
@@ -110,21 +120,38 @@ HWND get_native_hwnd() noexcept {
 }
 
 // LeiaSR DLLs are delay-loaded so the exe runs without the SR Platform
-// installed. Probe with LoadLibraryW before any SDK call -- touching SDK entry
-// points without the DLLs loaded would trigger the delay-load helper's SEH
-// exception. Probe DimencoWeaving.dll specifically: it's the deepest piece of
-// the SR runtime chain and has opencv_world343.dll as a transitive
-// dependency, so a successful LoadLibraryW here proves BOTH the SR runtime
-// and OpenCV resolve. (A partial install missing opencv would slip past a
-// probe of just SimulatedRealityCore/DirectX.)
+// installed. Probing with LoadLibraryW is what makes that safe: touching SDK
+// entry points without the DLLs on disk raises the delay-load helper's SEH
+// exception, which a C++ catch can't intercept without compiling this whole TU
+// /EHa.
+//
+// SR-lib runs this same probe inside CreateSRInterfaceDX12, so try_init()
+// doesn't strictly need it. We keep our own copy because is_runtime_installed()
+// exposes it to the UI thread, which must never reach the real init (see the
+// threading contract in the header) but still needs a cheap "is LeiaSR worth
+// offering" answer.
+//
+// Probe the DirectX weaver DLL, not just the core runtime: a machine can have
+// the core present while the backend weaver DLL is missing, which would clear a
+// core-only guard and then raise SEH inside CreateDX12Weaver -- exactly what the
+// preflight exists to prevent. SimulatedRealityDirectX.dll also statically
+// imports DimencoWeaving, SimulatedRealityCore, SimulatedRealityDisplays,
+// SimulatedRealityFaceTrackers and opencv_world343, so loading it resolves the
+// whole chain including the OpenCV dependency the SR import libs pull in.
+// DimencoWeaving is probed as well rather than leaning on that static
+// dependency set, which is an implementation detail of a given SDK build.
+//
+// Deliberately no FreeLibrary: we're about to use these ourselves, and another
+// module in the process may already depend on what we just loaded.
 bool sr_runtime_dlls_available() noexcept {
   static int s_cached = -1;
   if (s_cached >= 0) {
     return s_cached != 0;
   }
-  const HMODULE weaving = LoadLibraryW(L"DimencoWeaving.dll");
-  s_cached = (weaving != nullptr) ? 1 : 0;
-  return s_cached != 0;
+  const bool ok = LoadLibraryW(L"SimulatedRealityDirectX.dll") != nullptr && //
+                  LoadLibraryW(L"DimencoWeaving.dll") != nullptr;
+  s_cached = ok ? 1 : 0;
+  return ok;
 }
 
 void release_d3d_resources() noexcept {
@@ -142,12 +169,10 @@ void release_d3d_resources() noexcept {
   // Textures are gone, so any prior Dawn access is implicitly invalid.
   g_sbsInDawnAccess = false;
   g_wovenInDawnAccess = false;
-  // Force a fresh setInputViewTexture on the next weave -- the underlying
-  // ID3D12Resource pointer is gone and reusing the cached tuple would lie.
+  // Force a fresh SetInputTexture / SetOutputFormat on the next weave -- the
+  // underlying ID3D12Resource pointer is gone and reusing the cache would lie.
   g_lastWeaverInputResource = nullptr;
-  g_lastWeaverInputWidth = 0;
-  g_lastWeaverInputHeight = 0;
-  g_lastWeaverInputFormat = DXGI_FORMAT_UNKNOWN;
+  g_lastWeaverOutputFormat = DXGI_FORMAT_UNKNOWN;
 }
 
 // Transient predicates: if any of these fail, init() returns false but stays
@@ -158,7 +183,8 @@ bool dawn_is_ready() noexcept {
 }
 
 // RENDER-WORKER-THREAD ONLY. Runs SRContext::create / CreateDX12Weaver /
-// SRContext::initialize, which take Dawn's shared D3D12 device+queue and let
+// SRContext::initialize (inside SR-lib's CreateSRInterfaceDX12), which take
+// Dawn's shared D3D12 device+queue and let
 // the SR runtime take over + resize the host window (it re-enters the window
 // proc via SendMessage during initialize()). Calling this from the UI/main
 // thread deadlocks: that thread owns the message pump, and if it's blocked
@@ -209,71 +235,48 @@ bool try_init() {
     return false;
   }
 
-  // SDK may throw ServerNotAvailableException when the SR service isn't
-  // running. Treat any exception the same way -- log + disable.
-  SR::SRContext* srContext = nullptr;
+  // One call replaces context creation, weaver creation and context
+  // initialization: SR-lib performs them in the required order (initialize()
+  // strictly after the weaver exists, or eye tracking silently never engages
+  // and the panel shows an un-woven still). This is also the canonical "do you
+  // have a Leia display?" check -- CreateDX12Weaver succeeds only when an SR
+  // display is connected and addressable. Failures arrive as an HRESULT rather
+  // than an exception, including ServerNotAvailableException when the SR
+  // service isn't running; the try/catch is belt-and-braces.
+  SimulatedReality::SRInterfaceDX12* sr = nullptr;
   try {
-    srContext = SR::SRContext::create();
-  } catch (const std::exception& e) {
-    Log.warn("LeiaSR disabled: SRContext::create threw: {} (SR service running?)", e.what());
-    g_state = State::Disabled;
-    return false;
-  } catch (...) {
-    Log.warn("LeiaSR disabled: SRContext::create threw unknown exception");
-    g_state = State::Disabled;
-    return false;
-  }
-  if (srContext == nullptr) {
-    Log.warn("LeiaSR disabled: SRContext::create returned null");
-    g_state = State::Disabled;
-    return false;
-  }
-
-  // Create the weaver via the new IDX12Weaver1 factory. This is the canonical
-  // "do you have a Leia display?" check -- it returns WeaverSuccess only when
-  // an SR display is connected and addressable. (The old IDisplayManager
-  // probe in earlier revisions returned null even with the display attached.)
-  SR::IDX12Weaver1* weaver = nullptr;
-  try {
-    const ::WeaverErrorCode err = SR::CreateDX12Weaver(srContext, d3dDevice.Get(), hwnd, &weaver);
-    if (err != WeaverSuccess || weaver == nullptr) {
-      Log.warn("LeiaSR disabled: CreateDX12Weaver failed (error {})", static_cast<int>(err));
-      delete srContext;
+    const HRESULT hr = SimulatedReality::CreateSRInterfaceDX12(d3dDevice.Get(), hwnd, &sr);
+    if (FAILED(hr) || sr == nullptr) {
+      Log.warn("LeiaSR disabled: CreateSRInterfaceDX12 failed (hr 0x{:08x}; SR service running, display connected?)",
+               static_cast<uint32_t>(hr));
       g_state = State::Disabled;
       return false;
     }
   } catch (const std::exception& e) {
-    Log.warn("LeiaSR disabled: CreateDX12Weaver threw: {}", e.what());
-    delete srContext;
+    Log.warn("LeiaSR disabled: CreateSRInterfaceDX12 threw: {}", e.what());
+    g_state = State::Disabled;
+    return false;
+  } catch (...) {
+    Log.warn("LeiaSR disabled: CreateSRInterfaceDX12 threw unknown exception");
     g_state = State::Disabled;
     return false;
   }
 
   // Avoid double-gamma: our SBS intermediate and the swap chain hold linear
-  // UNORM values, so don't ask the weaver shader to convert either way.
+  // UNORM values, so don't ask the weaver shader to convert either way. This is
+  // weaver state rather than context state, so it doesn't matter that it now
+  // lands after SRContext::initialize() (which happened inside the create).
   try {
-    weaver->setShaderSRGBConversion(false, false);
+    sr->SetShaderSRGBConversion(false, false);
   } catch (...) {
     // Non-fatal -- fall back to whatever default the SDK picks.
-  }
-
-  // Initialize the context AFTER constructing the weaver -- this is what
-  // starts the eye-tracking pipeline. Failure here is non-fatal (the weaver
-  // will work, just without head-tracked interleave).
-  try {
-    srContext->initialize();
-  } catch (const std::exception& e) {
-    Log.warn("LeiaSR: SRContext::initialize threw: {}; tracker may not engage", e.what());
-  } catch (...) {
-    Log.warn("LeiaSR: SRContext::initialize threw unknown exception; tracker may not engage");
   }
 
   // Command allocator + list owned by the weaver path. Reset each frame.
   HRESULT hr = d3dDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_d3dAllocator));
   if (FAILED(hr)) {
     Log.warn("LeiaSR disabled: CreateCommandAllocator failed: 0x{:08x}", static_cast<uint32_t>(hr));
-    weaver->destroy();
-    delete srContext;
+    sr->Delete();
     g_state = State::Disabled;
     return false;
   }
@@ -282,8 +285,7 @@ bool try_init() {
   if (FAILED(hr)) {
     Log.warn("LeiaSR disabled: CreateCommandList failed: 0x{:08x}", static_cast<uint32_t>(hr));
     g_d3dAllocator.Reset();
-    weaver->destroy();
-    delete srContext;
+    sr->Delete();
     g_state = State::Disabled;
     return false;
   }
@@ -300,16 +302,14 @@ bool try_init() {
     Log.warn("LeiaSR disabled: CreateDescriptorHeap(RTV) failed: 0x{:08x}", static_cast<uint32_t>(hr));
     g_d3dCommandList.Reset();
     g_d3dAllocator.Reset();
-    weaver->destroy();
-    delete srContext;
+    sr->Delete();
     g_state = State::Disabled;
     return false;
   }
   g_wovenRtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
 
   // Commit all the successfully-created state.
-  g_srContext = srContext;
-  g_weaver = weaver;
+  g_sr = sr;
   g_d3dDevice = std::move(d3dDevice);
   g_d3dQueue = std::move(d3dQueue);
   g_hwnd = hwnd;
@@ -507,7 +507,7 @@ Extent input_extent() {
 }
 
 void weave() {
-  if (g_state != State::Ready || !g_weaver || !g_sbsResource || !g_wovenResource) {
+  if (g_state != State::Ready || !g_sr || !g_sbsResource || !g_wovenResource) {
     return;
   }
 
@@ -546,8 +546,14 @@ void weave() {
   // bind the woven RTV before calling weave().
   g_d3dCommandList->OMSetRenderTargets(1, &g_wovenRtv, FALSE, nullptr);
 
-  D3D12_VIEWPORT viewport{0.f, 0.f, static_cast<float>(g_width), static_cast<float>(g_height), 0.f, 1.f};
-  D3D12_RECT scissor{0, 0, static_cast<LONG>(g_width), static_cast<LONG>(g_height)};
+  // D3D12 rasterizes against whatever RSSetViewports last set ON THE COMMAND
+  // LIST, not against what the weaver is told below. Our command list is freshly
+  // reset each frame so nothing has dirtied it, but the weave still needs the
+  // destination extent set explicitly -- the woven output is g_width wide, half
+  // the SBS input, and a stale wider viewport would rasterize the weave at 2x
+  // and show only its left portion.
+  const D3D12_VIEWPORT viewport{0.f, 0.f, static_cast<float>(g_width), static_cast<float>(g_height), 0.f, 1.f};
+  const D3D12_RECT scissor{0, 0, static_cast<LONG>(g_width), static_cast<LONG>(g_height)};
   g_d3dCommandList->RSSetViewports(1, &viewport);
   g_d3dCommandList->RSSetScissorRects(1, &scissor);
 
@@ -557,44 +563,29 @@ void weave() {
   bool weave_fatal = false;
 
   try {
-    // SBS input is 2x width; weaver weaves it down to the bound RT's size.
-    // Cache the (resource, width, height, format) tuple -- setInputViewTexture
-    // tells the weaver to rebind its sampling source, so skip it when the
-    // dimensions / format / resource pointer haven't changed (the common case
-    // after the first frame post-resize).
-    const uint32_t inputW = g_width * 2;
-    if (g_sbsResource.Get() != g_lastWeaverInputResource || inputW != g_lastWeaverInputWidth ||
-        g_height != g_lastWeaverInputHeight || g_dxgiFormat != g_lastWeaverInputFormat) {
-      g_weaver->setInputViewTexture(g_sbsResource.Get(), static_cast<int>(inputW), static_cast<int>(g_height),
-                                    g_dxgiFormat);
+    // The SBS input is 2x width and SR-lib reads that extent (and the format)
+    // straight off the resource desc, so the weaver can't be told a size the
+    // texture doesn't have. Rebinding isn't free -- it makes the weaver
+    // re-create its sampling view -- so skip it while the resource is unchanged,
+    // which is every frame except the first after a (re)allocation.
+    if (g_sbsResource.Get() != g_lastWeaverInputResource) {
+      g_sr->SetInputTexture(g_sbsResource.Get());
       g_lastWeaverInputResource = g_sbsResource.Get();
-      g_lastWeaverInputWidth = inputW;
-      g_lastWeaverInputHeight = g_height;
-      g_lastWeaverInputFormat = g_dxgiFormat;
     }
-    g_weaver->setOutputFormat(g_dxgiFormat);
-    g_weaver->setCommandList(g_d3dCommandList.Get());
-    g_weaver->setViewport(viewport);
-    g_weaver->setScissorRect(scissor);
+    // Must match the bound render target's actual format; a mismatch weaves with
+    // visibly wrong colors rather than failing.
+    if (g_dxgiFormat != g_lastWeaverOutputFormat) {
+      g_sr->SetOutputFormat(g_dxgiFormat);
+      g_lastWeaverOutputFormat = g_dxgiFormat;
+    }
+    // Sets the command list + viewport + scissor and records the weave into it.
+    g_sr->Weave(g_d3dCommandList.Get(), viewport, scissor);
   } catch (const std::exception& e) {
-    Log.warn("LeiaSR: weaver setup threw: {}", e.what());
+    Log.warn("LeiaSR: weave threw: {}", e.what());
     weave_fatal = true;
   } catch (...) {
-    Log.warn("LeiaSR: weaver setup threw unknown exception");
+    Log.warn("LeiaSR: weave threw unknown exception");
     weave_fatal = true;
-  }
-
-  // weave() records commands into the bound command list.
-  if (!weave_fatal) {
-    try {
-      g_weaver->weave();
-    } catch (const std::exception& e) {
-      Log.warn("LeiaSR: weave threw: {}", e.what());
-      weave_fatal = true;
-    } catch (...) {
-      Log.warn("LeiaSR: weave threw unknown exception");
-      weave_fatal = true;
-    }
   }
 
   if (weave_fatal) {
@@ -646,12 +637,14 @@ void weave() {
 
 void shutdown() {
   release_d3d_resources();
-  // Weaver must be destroyed before the context that owns it. IDX12Weaver1
-  // uses destroy() (IDestroyable) rather than `delete`; the old deprecated
-  // PredictingDX12Weaver pattern of `delete weaver` does not apply.
-  if (g_weaver != nullptr) {
-    g_weaver->destroy();
-    g_weaver = nullptr;
+  // Delete() destroys the weaver (via IDestroyable::destroy(), never `delete` --
+  // that's the deprecated PredictingDX12Weaver convention and asserts in debug)
+  // and then releases the SRContext with SRContext::deleteSRContext(), the
+  // matching pair for SRContext::create(). Both live in the SR DLL, so freeing
+  // either with our own `delete` would put them on the wrong heap.
+  if (g_sr != nullptr) {
+    g_sr->Delete();
+    g_sr = nullptr;
   }
   g_wovenRtv = {};
   g_rtvHeap.Reset();
@@ -659,12 +652,6 @@ void shutdown() {
   g_d3dAllocator.Reset();
   g_d3dQueue.Reset();
   g_d3dDevice.Reset();
-  if (g_srContext != nullptr) {
-    // The new factory pattern wants `delete` (no deleteSRContext static); the
-    // SDK's RT64 example does the same.
-    delete g_srContext;
-    g_srContext = nullptr;
-  }
   g_state = State::Uninit;
 }
 

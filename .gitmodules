@@ -1,3 +1,4 @@
-[submodule "extern/leiasr"]
-	path = extern/leiasr
-	url = https://github.com/oneup03/LeiaSR64.git
+[submodule "extern/SR-lib"]
+	path = extern/SR-lib
+	url = https://github.com/bo3b/SR-lib.git
+	branch = api_expansion

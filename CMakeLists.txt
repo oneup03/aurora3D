@@ -14,39 +14,50 @@ option(AURORA_ENABLE_RMLUI "Enable HTML/CSS Based UI Library for use in end-user
 option(AURORA_CACHE_USE_ZSTD "Compress WebGPU cache entries with zstd" ON)
 
 # LeiaSR autostereoscopic weaving (Windows x64 + D3D12 backend only).
-# Vendored at extern/leiasr; overridable via LEIASR_SDKROOT (env var wins).
-# Re-derived every configure so a stale cache (e.g. after moving the submodule)
-# doesn't strand us pointing at a path that no longer exists.
+#
+# The SR SDK is not on any package index, so it is vendored through the
+# bo3b/SR-lib submodule (api_expansion branch) at extern/SR-lib. Its CMakeLists
+# locates the nested per-architecture SDK tree, exposes SRLib::SDK (headers +
+# import libs) and SRLib::SR (that, plus SR.cpp's SRInterface* wrapper), and
+# provides srlib_apply_delayload() carrying the complete /DELAYLOAD list. Our
+# lib/webgpu/leiasr.cpp drives the wrapper, so aurora_core links SRLib::SR.
+#
+# Deliberately not find_package(simulatedreality): the SDK's own CMake configs
+# declare their targets SHARED IMPORTED and CMake then demands the runtime
+# bin/*.dll sit next to each .lib. SR-lib ships import libraries only -- the
+# DLLs belong to the user's system-wide SR Platform install and must not be
+# redistributed -- so find_package fails with a misleading "The installation
+# package was faulty".
+#
+# SRLIB_FOUND comes back FALSE on non-Windows and when the (private) submodule
+# was never checked out, so a clone without SR-lib access still configures and
+# builds; LeiaSR just isn't offered and the game falls back to the other stereo
+# modes.
 #
 # The SR SDK ships x64 (and x86) Windows import libraries only -- there is no
 # ARM64 build of the SR runtime -- so LeiaSR must be excluded on Windows-on-ARM
 # targets. Detect the TARGET arch (not the host): MSVC populates
 # CMAKE_CXX_COMPILER_ARCHITECTURE_ID (ARM / ARM64 / ARM64EC / X86 / x64), and
 # CMAKE_SYSTEM_PROCESSOR (ARM64 / AMD64 / ...) is the fallback for other
-# toolchains. Either matching ARM disables LeiaSR entirely (empty
-# LEIASR_SDKROOT -> AURORA_ENABLE_LEIASR OFF -> no find_package / sources /
-# link / delay-load), and the game falls back to the other stereo modes.
+# toolchains.
 set(_leiasr_is_arm FALSE)
 if (CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "[Aa][Rr][Mm]" OR
     CMAKE_SYSTEM_PROCESSOR MATCHES "[Aa][Rr][Mm]")
   set(_leiasr_is_arm TRUE)
 endif ()
 
-set(_leiasr_env "$ENV{LEIASR_SDKROOT}")
-set(_leiasr_vendored "${CMAKE_CURRENT_SOURCE_DIR}/extern/leiasr")
-set(_leiasr_resolved "")
-if (WIN32 AND NOT _leiasr_is_arm)
-  if (_leiasr_env AND EXISTS "${_leiasr_env}/lib/cmake")
-    set(_leiasr_resolved "${_leiasr_env}")
-  elseif (EXISTS "${_leiasr_vendored}/lib/cmake")
-    set(_leiasr_resolved "${_leiasr_vendored}")
-  endif ()
+set(SRLIB_FOUND FALSE)
+if (WIN32 AND NOT _leiasr_is_arm AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/SR-lib/CMakeLists.txt")
+  add_subdirectory(extern/SR-lib)
 endif ()
-set(LEIASR_SDKROOT "${_leiasr_resolved}" CACHE PATH "Path to LeiaSR / Simulated Reality SDK root" FORCE)
-set(AURORA_ENABLE_LEIASR OFF)
-if (LEIASR_SDKROOT)
-  set(AURORA_ENABLE_LEIASR ON)
-  message(STATUS "aurora: LeiaSR enabled (${LEIASR_SDKROOT})")
+
+# Cached (not a plain variable) so consumers that add_subdirectory() aurora --
+# e.g. dusklight, which needs to know whether to call srlib_apply_delayload() on
+# its executable -- can see it from their own scope. Re-derived every configure
+# so a stale cache from a build where the submodule was missing doesn't stick.
+set(AURORA_ENABLE_LEIASR ${SRLIB_FOUND} CACHE INTERNAL "LeiaSR autostereoscopic output is available")
+if (AURORA_ENABLE_LEIASR)
+  message(STATUS "aurora: LeiaSR enabled (${SRLIB_SDKROOT})")
 endif ()
 
 # Dependency versions

@@ -88,6 +88,68 @@ Vec2<int> fit_frame_buffer_to_aspect(int width, int height, float aspect) {
 }
 
 #if defined(SDL_PLATFORM_WIN32)
+// Declare the process per-monitor-DPI-aware, and log what actually took.
+//
+// This matters most for the LeiaSR weave, which only produces correct autostereo
+// when it lands 1:1 on physical panel pixels. Without per-monitor awareness, a
+// display at >100% Windows scale makes the OS map our window -- and so the
+// weaver's output -- into a DPI-virtualized sub-region of the panel and stretch
+// it up, at which point the weave no longer aligns to the lenticular lens and
+// the 3D collapses into blur. Every SR SDK sample declares this at startup. It
+// also underpins fix_dpi_unaware_external_resize() below, which can only detect
+// an oversized window from an aware context.
+//
+// DPI awareness is ONE-SHOT: the first declaration wins and later calls fail
+// silently. SDL declares per-monitor-v2 itself during SDL_InitSubSystem(
+// SDL_INIT_VIDEO), so this must run before that or it's a no-op -- and it stays
+// worth doing rather than relying on SDL, because a host that embeds aurora may
+// have already declared something weaker. The readback is the point of the log
+// line: without it there is no way to tell from a support report whether the
+// process ended up per-monitor, system-aware or unaware.
+//
+// Resolved dynamically: SetProcessDpiAwarenessContext is Windows 10 1703+, and
+// GetProcAddress keeps this independent of the SDK's WINVER.
+void declare_dpi_awareness() noexcept {
+  using PFN_SetProcessDpiAwarenessContext = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+  using PFN_GetThreadDpiAwarenessContext = DPI_AWARENESS_CONTEXT(WINAPI*)();
+  using PFN_GetAwarenessFromDpiAwarenessContext = DPI_AWARENESS(WINAPI*)(DPI_AWARENESS_CONTEXT);
+
+  const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+  if (user32 == nullptr) {
+    return;
+  }
+  const auto setContext =
+      reinterpret_cast<PFN_SetProcessDpiAwarenessContext>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+  if (setContext != nullptr) {
+    // A false return here is the expected result when awareness was already
+    // declared (by SDL, or by a host embedding us), not an error worth logging
+    // -- the readback below reports what we actually ended up with.
+    setContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  }
+
+  const auto getThreadContext =
+      reinterpret_cast<PFN_GetThreadDpiAwarenessContext>(GetProcAddress(user32, "GetThreadDpiAwarenessContext"));
+  const auto getAwareness = reinterpret_cast<PFN_GetAwarenessFromDpiAwarenessContext>(
+      GetProcAddress(user32, "GetAwarenessFromDpiAwarenessContext"));
+  if (getThreadContext == nullptr || getAwareness == nullptr) {
+    return;
+  }
+  switch (getAwareness(getThreadContext())) {
+  case DPI_AWARENESS_PER_MONITOR_AWARE:
+    Log.info("DPI awareness: per-monitor");
+    break;
+  case DPI_AWARENESS_SYSTEM_AWARE:
+    Log.warn("DPI awareness: system-aware; output on a scaled display will be stretched by the OS");
+    break;
+  case DPI_AWARENESS_UNAWARE:
+    Log.warn("DPI awareness: unaware; output on a scaled display will be stretched by the OS");
+    break;
+  default:
+    Log.warn("DPI awareness: unknown");
+    break;
+  }
+}
+
 // A DPI-unaware external window manager (observed: the LeiaSR / SimulatedReality
 // service positioning our window on its display) can SetWindowPos this window
 // using virtualized coordinates. Windows scales that request by the monitor's
@@ -399,6 +461,11 @@ bool initialize() {
   /* We don't want to initialize anything input related here, otherwise the add events will get lost to the void */
   TRY(SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight"), "Error setting {}: {}", SDL_HINT_ORIENTATIONS,
       SDL_GetError());
+#if defined(SDL_PLATFORM_WIN32)
+  // Before SDL touches video: DPI awareness is one-shot and SDL declares its own
+  // during SDL_InitSubSystem(SDL_INIT_VIDEO).
+  declare_dpi_awareness();
+#endif
   TRY(SDL_InitSubSystem(SDL_INIT_EVENTS | SDL_INIT_VIDEO), "Error initializing SDL: {}", SDL_GetError());
 
 #if !defined(_WIN32) && !defined(__APPLE__)
