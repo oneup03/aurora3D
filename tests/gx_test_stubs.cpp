@@ -48,6 +48,20 @@ uint32_t g_mergedDrawCallCount = 0;
 
 namespace aurora::webgpu {
 GraphicsConfig g_graphicsConfig{};
+// Referenced by command_processor.cpp's stereo corrections (the water-reflection
+// PTTEXMTX fix and the indirect-texture amplitude scale). Defaults here are the
+// stereo-off values, so those code paths stay inert under test unless a case
+// deliberately sets them.
+AuroraStereoConfig g_stereoCfg{
+    .mode = AURORA_STEREO_OFF,
+    .eyeSeparation = 0.f,
+    .convergence = 0.f,
+    .hudDepth = 0.f,
+    .refractionAmplitudeScale = 1.f,
+    .ghostContrast = 1.f,
+    .ghostBlackFloor = 0.f,
+};
+AuroraEye g_activeEye = AURORA_EYE_LEFT;
 } // namespace aurora::webgpu
 
 // --- GXState (the real instance -- tests validate this) ---
