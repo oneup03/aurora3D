@@ -56,6 +56,26 @@ wgpu::TextureFormat depth_format() noexcept;
 uint32_t sample_count() noexcept;
 bool uses_reversed_z() noexcept;
 
+/// Depth snapshot queries. The renderer keeps a rate-limited (30Hz),
+/// triple-buffered CPU-side copy of the frame's final depth attachment,
+/// downscaled to the logical GC framebuffer grid, with values normalized to GX
+/// Z24: 0 at the near plane, 0x00FFFFFF at the far plane, INCREASING WITH
+/// DISTANCE in both the forward and reversed-Z configurations. Because the
+/// capture is taken on the last render pass of the frame, and 2D/J2D drawing
+/// runs with depth writes disabled, the grid holds the 3D scene only.
+///
+/// Arms a capture. Cheap and idempotent; the rate limiter decides when one is
+/// actually taken, so callers that want a steady stream just call it per frame.
+void request_depth_snapshot() noexcept;
+/// Counter bumped once per landed snapshot; 0 until the first one arrives.
+/// Compare against the last value you processed to skip redundant reductions.
+uint64_t depth_snapshot_generation() noexcept;
+/// Reduces a normalized [0,1] region of the latest snapshot to cols*rows block
+/// minima (the nearest Z24 in each block) in one pass. `out` needs cols*rows
+/// entries. Returns the generation sampled, or 0 if no snapshot exists yet.
+uint64_t sample_depth_snapshot_min(float x0, float y0, float x1, float y1, uint32_t cols, uint32_t rows,
+                                   uint32_t* out) noexcept;
+
 DrawTypeId register_draw_type(const DrawTypeDescriptor& desc);
 void unregister_draw_type(DrawTypeId type) noexcept;
 /// Records an inline custom draw into the currently open render pass at the

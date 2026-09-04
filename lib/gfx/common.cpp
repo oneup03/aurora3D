@@ -921,6 +921,13 @@ uint32_t sample_count() noexcept { return webgpu::g_graphicsConfig.msaaSamples; 
 
 bool uses_reversed_z() noexcept { return gx::UseReversedZ; }
 
+void request_depth_snapshot() noexcept { depth_peek::request_snapshot(); }
+uint64_t depth_snapshot_generation() noexcept { return depth_peek::latest_generation(); }
+uint64_t sample_depth_snapshot_min(float x0, float y0, float x1, float y1, uint32_t cols, uint32_t rows,
+                                   uint32_t* out) noexcept {
+  return depth_peek::reduce_min_blocks(x0, y0, x1, y1, cols, rows, out);
+}
+
 DrawTypeId register_draw_type(const DrawTypeDescriptor& desc) {
   if (desc.draw == nullptr) {
     Log.warn("register_draw_type: draw callback is null");
