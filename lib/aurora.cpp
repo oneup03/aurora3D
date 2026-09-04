@@ -301,17 +301,16 @@ void end_frame() noexcept {
       const bool stereo_active = webgpu::g_stereoCfg.mode != AURORA_STEREO_OFF;
       {
         // Compose parameters for the stereo-aware XFB copy shader. Mode 0
-        // (OFF) degenerates to a plain left-eye blit.
-        struct StereoUboData {
-          uint32_t mode;
-          float w;
-          float h;
-          float hudDepth;
-        } stereoUboData{
+        // (OFF) degenerates to a plain left-eye blit. The ghost-reduction
+        // levers are already forced to their no-ops by the caller when stereo
+        // is off (dusk::stereo::apply_config_from_settings).
+        const webgpu::StereoUboData stereoUboData{
             .mode = static_cast<uint32_t>(webgpu::g_stereoCfg.mode),
             .w = viewport.width,
             .h = viewport.height,
             .hudDepth = webgpu::g_stereoCfg.hudDepth,
+            .ghostContrast = webgpu::g_stereoCfg.ghostContrast,
+            .ghostBlackFloor = webgpu::g_stereoCfg.ghostBlackFloor,
         };
         g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &stereoUboData, sizeof(stereoUboData));
       }
@@ -343,13 +342,19 @@ void end_frame() noexcept {
                                                                 webgpu::g_graphicsConfig.surfaceConfiguration.format);
         if (leiasr_active) {
           // Force SBS mode in the StereoUbo just for the input-render pass so the
-          // existing compose shader produces a side-by-side image.
-          struct StereoUboData {
-            uint32_t mode;
-            float w;
-            float h;
-            float hudDepth;
-          } sbsUbo{static_cast<uint32_t>(AURORA_STEREO_SBS), viewport.width, viewport.height, 0.0f};
+          // existing compose shader produces a side-by-side image. Ghost
+          // reduction MUST be applied here, on the SbS intermediate, i.e.
+          // BEFORE the weave: residual ghosting on an SR panel is the weaver's
+          // own crosstalk cancellation clipping at 0/1, so the range has to be
+          // compressed on the pixels the weaver is about to read.
+          const webgpu::StereoUboData sbsUbo{
+              .mode = static_cast<uint32_t>(AURORA_STEREO_SBS),
+              .w = viewport.width,
+              .h = viewport.height,
+              .hudDepth = 0.0f,
+              .ghostContrast = webgpu::g_stereoCfg.ghostContrast,
+              .ghostBlackFloor = webgpu::g_stereoCfg.ghostBlackFloor,
+          };
           g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &sbsUbo, sizeof(sbsUbo));
 
           wgpu::TextureView sbsView = webgpu::leiasr::input_view();
@@ -392,16 +397,22 @@ void end_frame() noexcept {
 
             // Reset the StereoUbo to mode 0 (OFF) so the EFB-copy below samples
             // the woven texture cleanly through the case 0 branch (and the UI
-            // overlay lands as a plain screen-depth blit).
-            struct StereoUboData monoUbo{0u, viewport.width, viewport.height, 0.0f};
+            // overlay lands as a plain screen-depth blit). Ghost reduction is
+            // left at its no-op defaults here -- it already ran on the SbS
+            // input above, and running it a second time on the woven output
+            // would double-compress the range.
+            const webgpu::StereoUboData monoUbo{
+                .mode = 0u, .w = viewport.width, .h = viewport.height, .hudDepth = 0.0f};
             g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &monoUbo, sizeof(monoUbo));
 
             // Replace presentBindGroup with one bound to the woven output.
             presentBindGroup = webgpu::create_copy_bind_group(webgpu::leiasr::output_texture());
           } else {
             // Couldn't acquire the SBS input texture this frame; fall back to a
-            // plain mono compose so the user still sees something.
-            struct StereoUboData monoUbo{0u, viewport.width, viewport.height, 0.0f};
+            // plain mono compose so the user still sees something. No stereo
+            // means no crosstalk, so ghost reduction stays at its no-ops.
+            const webgpu::StereoUboData monoUbo{
+                .mode = 0u, .w = viewport.width, .h = viewport.height, .hudDepth = 0.0f};
             g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &monoUbo, sizeof(monoUbo));
           }
         } else if (webgpu::g_stereoCfg.mode == AURORA_STEREO_LEIASR) {
@@ -414,12 +425,8 @@ void end_frame() noexcept {
           // setter force-fell-back to OFF synchronously; that path did the
           // SR init on the UI thread and deadlocked, so the fallback moved
           // here where it costs one already-computed resample.
-          struct StereoUboData {
-            uint32_t mode;
-            float w;
-            float h;
-            float hudDepth;
-          } monoUbo{0u, viewport.width, viewport.height, 0.0f};
+          const webgpu::StereoUboData monoUbo{
+              .mode = 0u, .w = viewport.width, .h = viewport.height, .hudDepth = 0.0f};
           g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &monoUbo, sizeof(monoUbo));
           presentBindGroup = webgpu::create_copy_bind_group(leftResampled);
         }

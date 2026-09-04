@@ -165,6 +165,36 @@ typedef struct {
   // callers building this struct with aggregate init must include this
   // field, otherwise it zero-initializes to a flat refraction.
   float refractionAmplitudeScale;
+
+  // Ghost / crosstalk reduction. Every stereo display leaks some of each
+  // eye's image into the other; how visible that leak is depends on the
+  // BRIGHTNESS DIFFERENCE between the eyes, so compressing the signal range
+  // in the compose pass (the last thing that touches the pixels before they
+  // reach the panel) reduces what you see. Two independent levers, both
+  // global, both exact no-ops at their defaults:
+  //
+  //  ghostContrast   1.0 = off. Squeezes toward mid-grey, shrinking |L - R|
+  //                  directly and leaving (1-contrast)/2 of headroom at EACH
+  //                  end of the range. Costs contrast across the whole image.
+  //                  Useful range ~0.90..1.0.
+  //  ghostBlackFloor 0.0 = off. Raises the black floor and leaves white
+  //                  alone. Displays that CANCEL crosstalk (autostereo
+  //                  panels, incl. the LeiaSR weaver) pre-subtract a fraction
+  //                  of the opposite eye, which drives dark pixels below zero
+  //                  where the render target clamps them -- and the clamped
+  //                  part is exactly what survives as a visible ghost. This
+  //                  lever buys foot-room for that. Costs black level rather
+  //                  than contrast. Useful range ~0.02..0.05; blacks go grey
+  //                  fast above that. Only helps on displays that actually
+  //                  cancel; where nothing subtracts, only ghostContrast
+  //                  reduces visible ghosting.
+  //
+  // Both are applied LAST in the compose shader, after mode selection, and
+  // are expected to be forced to (1.0, 0.0) by the caller when mode ==
+  // AURORA_STEREO_OFF. Callers using aggregate init MUST set these -- a
+  // zero-initialized ghostContrast would flatten the image to mid-grey.
+  float ghostContrast;
+  float ghostBlackFloor;
 } AuroraStereoConfig;
 
 typedef enum {

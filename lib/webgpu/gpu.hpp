@@ -57,6 +57,30 @@ extern wgpu::RenderPipeline g_UIOverlayPipeline;
 extern wgpu::Buffer g_StereoUbo;
 extern AuroraStereoConfig g_stereoCfg;
 extern AuroraEye g_activeEye;
+
+// Byte size of g_StereoUbo. The six live scalars (mode, w, h, hudDepth,
+// ghostContrast, ghostBlackFloor) occupy 24 bytes; WGSL rounds a uniform-
+// address-space struct up to a 16-byte multiple, so the buffer, both WGSL
+// `StereoUbo` declarations (compose + UI overlay), every bind-group entry's
+// `.size`, every layout's `minBindingSize`, and every `StereoUboData` written
+// through g_queue.WriteBuffer must all agree on 32.
+inline constexpr uint64_t kStereoUboSize = 32;
+
+// CPU-side mirror of the WGSL `StereoUbo` layout. Use this for every write to
+// g_StereoUbo rather than a locally-declared struct -- the ghost-reduction
+// fields default to their no-op values here, so a partially-initialized write
+// can't accidentally flatten the image to mid-grey (ghostContrast == 0).
+struct StereoUboData {
+  uint32_t mode = 0;
+  float w = 0.f;
+  float h = 0.f;
+  float hudDepth = 0.f;
+  float ghostContrast = 1.f;
+  float ghostBlackFloor = 0.f;
+  float _pad0 = 0.f;
+  float _pad1 = 0.f;
+};
+static_assert(sizeof(StereoUboData) == kStereoUboSize, "StereoUboData must match the WGSL StereoUbo layout");
 extern wgpu::Instance g_instance;
 extern wgpu::AdapterInfo g_adapterInfo;
 extern bool g_hasCoreFeatures;

@@ -53,6 +53,8 @@ AuroraStereoConfig g_stereoCfg{
     .convergence = 5.0f,
     .hudDepth = 0.0f,
     .refractionAmplitudeScale = 1.0f,
+    .ghostContrast = 1.0f,
+    .ghostBlackFloor = 0.0f,
 };
 AuroraEye g_activeEye = AURORA_EYE_LEFT;
 
@@ -433,6 +435,10 @@ struct StereoUbo {
     w: f32,
     h: f32,
     hudDepth: f32,
+    ghostContrast: f32,
+    ghostBlackFloor: f32,
+    _pad0: f32,
+    _pad1: f32,
 };
 
 @group(0) @binding(0)
@@ -466,6 +472,36 @@ fn vs_main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
     out.pos = vec4<f32>(pos[vtxIdx], 0.0, 1.0);
     out.uv = uvs[vtxIdx];
     return out;
+}
+
+// Ghost / crosstalk range compression. Runs LAST, on the composed pixel, so
+// what gets compressed is exactly what reaches the panel.
+//
+// SPACE: this operates on the values as encoded, with no linearize/re-encode
+// pair around it, and that is deliberate -- the swap-chain format is forced
+// to a non-sRGB UNORM (see best_surface_format/to_linear), so the EFB content
+// this shader samples is already display-encoded, and the LeiaSR weaver is
+// initialized with SetShaderSRGBConversion(false, false) (leiasr.cpp), i.e.
+// its own crosstalk cancellation reads and writes those same encoded values.
+// The correction has to live in whatever space the display's cancellation
+// lives in; if either of those two facts changes, wrap this in
+// pow(c, 2.2) / pow(c, 1/2.2) so the two stay consistent.
+//
+// contrast == 1.0 and blackFloor == 0.0 are exact no-ops and are branched
+// out, so the untouched path stays bit-exact and free.
+fn ghost_reduce(c: vec3<f32>) -> vec3<f32> {
+    if (stereo.ghostContrast == 1.0 && stereo.ghostBlackFloor == 0.0) {
+        return c;
+    }
+    var v = saturate(c);
+    // Squeeze toward mid-grey: shrinks |L - R| and leaves headroom at both
+    // ends of the range.
+    v = (v - vec3<f32>(0.5)) * stereo.ghostContrast + vec3<f32>(0.5);
+    // Raise the black floor, leave white alone: foot-room for a cancelling
+    // display's subtraction, which would otherwise clip at 0 and leave the
+    // clipped part visible as a ghost.
+    v = v * (1.0 - stereo.ghostBlackFloor) + vec3<f32>(stereo.ghostBlackFloor);
+    return saturate(v);
 }
 
 @fragment
@@ -533,7 +569,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             color = l_full;
         }
     }
-    return vec4<f32>(color, 1.0);
+    return vec4<f32>(ghost_reduce(color), 1.0);
 }
 
 @fragment
@@ -579,7 +615,7 @@ fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
           .buffer =
               wgpu::BufferBindingLayout{
                   .type = wgpu::BufferBindingType::Uniform,
-                  .minBindingSize = 16,
+                  .minBindingSize = kStereoUboSize,
               },
       },
   };
@@ -647,11 +683,15 @@ fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
   g_CopyPremultipliedAlphaPipeline =
       make_copy_pipeline("XFB Premultiplied Alpha Copy Pipeline", "fs_premultiplied_alpha", &premultipliedAlphaBlend);
 
-  // Stereo uniform buffer (16 bytes: mode, w, h, hudDepth)
+  // Stereo uniform buffer. 32 bytes: mode, w, h, hudDepth, ghostContrast,
+  // ghostBlackFloor + 8 bytes of tail padding -- WGSL rounds a uniform-address-
+  // space struct up to a 16-byte multiple, so the six live scalars (24 bytes)
+  // must be padded to 32. Keep this in sync with kStereoUboSize and with BOTH
+  // WGSL `StereoUbo` declarations (compose + UI overlay).
   const wgpu::BufferDescriptor stereoUboDescriptor{
       .label = "Stereo UBO",
       .usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
-      .size = 16,
+      .size = kStereoUboSize,
   };
   g_StereoUbo = g_device.CreateBuffer(&stereoUboDescriptor);
 }
@@ -659,11 +699,20 @@ fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
 static void create_ui_overlay_pipeline() {
   wgpu::ShaderSourceWGSL sourceDescriptor{};
   sourceDescriptor.code = R"""(
+// Must mirror the compose shader's StereoUbo exactly -- both bind the same
+// 32-byte g_StereoUbo. The overlay deliberately ignores the ghost-reduction
+// fields: the rmlui overlay sits at screen depth (zero parallax) and so has
+// no inter-eye difference to ghost, while the in-game J2D HUD arrives through
+// the EFB and is already covered by the compose pass.
 struct StereoUbo {
     mode: u32,
     w: f32,
     h: f32,
     hudDepth: f32,
+    ghostContrast: f32,
+    ghostBlackFloor: f32,
+    _pad0: f32,
+    _pad1: f32,
 };
 
 @group(0) @binding(0) var ui_sampler: sampler;
@@ -779,7 +828,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
           .buffer =
               wgpu::BufferBindingLayout{
                   .type = wgpu::BufferBindingType::Uniform,
-                  .minBindingSize = 16,
+                  .minBindingSize = kStereoUboSize,
               },
       },
   };
@@ -915,7 +964,7 @@ wgpu::BindGroup create_ui_overlay_bind_group(const TextureWithSampler& uiTexture
       wgpu::BindGroupEntry{
           .binding = 2,
           .buffer = g_StereoUbo,
-          .size = 16,
+          .size = kStereoUboSize,
       },
   };
   const wgpu::BindGroupDescriptor bindGroupDescriptor{
@@ -943,7 +992,7 @@ wgpu::BindGroup create_copy_bind_group_stereo(const TextureWithSampler& left, co
       wgpu::BindGroupEntry{
           .binding = 3,
           .buffer = g_StereoUbo,
-          .size = 16,
+          .size = kStereoUboSize,
       },
   };
   const wgpu::BindGroupDescriptor bindGroupDescriptor{
