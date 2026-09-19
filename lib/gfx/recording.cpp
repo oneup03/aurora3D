@@ -80,34 +80,42 @@ std::string pass_label(std::string_view kind) {
 }
 
 void set_efb_targets(RenderPass& pass) {
+  // Stereo renders the scene once per eye into its own EFB set; g_activeEye
+  // selects which one this pass targets. In mono the right-eye textures are
+  // simply never selected.
+  const bool right = webgpu::g_activeEye == AURORA_EYE_RIGHT;
+  const auto& frameBuffer = right ? webgpu::g_frameBufferRight : webgpu::g_frameBuffer;
+  const auto& frameBufferResolved = right ? webgpu::g_frameBufferResolvedRight : webgpu::g_frameBufferResolved;
+  const auto& depthBuffer = right ? webgpu::g_depthBufferRight : webgpu::g_depthBuffer;
+  const auto& normalBuffer = right ? webgpu::g_normalBufferRight : webgpu::g_normalBuffer;
+
   const auto layout = scene_render_target_layout();
   pass.colorAttachmentCount = layout.colorAttachmentCount;
   auto& sceneColor = pass.colorAttachments[SceneColorAttachmentIndex];
   sceneColor.semantic = ColorAttachmentSemantic::SceneColor;
   sceneColor.format = layout.colorAttachments[SceneColorAttachmentIndex].format;
-  sceneColor.size = webgpu::g_frameBuffer.size;
-  sceneColor.view = webgpu::g_frameBuffer.view;
-  sceneColor.resolveView = layout.sampleCount > 1 ? webgpu::g_frameBufferResolved.view : nullptr;
+  sceneColor.size = frameBuffer.size;
+  sceneColor.view = frameBuffer.view;
+  sceneColor.resolveView = layout.sampleCount > 1 ? frameBufferResolved.view : nullptr;
   for (uint32_t i = SceneColorAttachmentIndex + 1; i < layout.colorAttachmentCount; ++i) {
     auto& color = pass.colorAttachments[i];
     color.semantic = layout.colorAttachments[i].semantic;
     color.format = layout.colorAttachments[i].format;
     if (color.semantic == ColorAttachmentSemantic::Normal) {
-      color.size = webgpu::g_normalBuffer.size;
-      color.view = webgpu::g_normalBuffer.view;
+      color.size = normalBuffer.size;
+      color.view = normalBuffer.view;
     } else {
       AURORA_ASSERT(false, "Scene render-target attachment {} has no backing texture", i);
     }
   }
-  pass.depthStencilView = webgpu::g_depthBuffer.view;
+  pass.depthStencilView = depthBuffer.view;
   pass.depthStencilFormat = layout.depthStencilFormat;
   pass.copySourceTexture =
-      webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.texture : webgpu::g_frameBuffer.texture;
-  pass.copySourceView =
-      webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : webgpu::g_frameBuffer.view;
-  pass.copySourceDepthView = webgpu::g_depthBuffer.view;
+      webgpu::g_graphicsConfig.msaaSamples > 1 ? frameBufferResolved.texture : frameBuffer.texture;
+  pass.copySourceView = webgpu::g_graphicsConfig.msaaSamples > 1 ? frameBufferResolved.view : frameBuffer.view;
+  pass.copySourceDepthView = depthBuffer.view;
   if (webgpu::g_graphicsConfig.normalBuffer) {
-    pass.copySourceNormalTexture = webgpu::g_normalBuffer.texture;
+    pass.copySourceNormalTexture = normalBuffer.texture;
   }
   pass.msaaSamples = layout.sampleCount;
   pass.hasDepth = true;
@@ -984,6 +992,38 @@ void end_offscreen() {
   ZoneScoped;
   finish_current_offscreen();
   restore_efb();
+}
+
+void begin_new_efb_pass_for_active_eye() {
+  ZoneScoped;
+  if (!g_recorder.active() || g_recorder.currentRenderPass == UINT32_MAX) {
+    // Between frames; the next begin_recording will pick up the new active eye.
+    return;
+  }
+  if (g_recorder.inOffscreen) {
+    Log.warn("begin_new_efb_pass_for_active_eye called during offscreen rendering; ignoring");
+    return;
+  }
+
+  // Seal and hand off the current eye's pass, then open a fresh EFB pass
+  // targeting the newly active eye's buffers -- set_efb_targets reads
+  // webgpu::g_activeEye, which the caller has already flipped.
+  enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
+
+  RenderPass newPass{.label = pass_label("EFB")};
+  set_efb_targets(newPass);
+  // The eye we're switching to has not been cleared yet this frame, so give
+  // this pass the same clear state begin_recording gives pass 0. Leaving the
+  // RenderPass defaults in place would clear the second eye to transparent
+  // black while the first cleared to the GX clear color, and the two eyes
+  // would disagree wherever geometry doesn't cover the viewport.
+  newPass.colorAttachments[SceneColorAttachmentIndex].clearValue = gx::g_gxState.clearColor;
+  newPass.clearDepthValue = gx::clear_depth_value();
+  current_render_passes().emplace_back(std::move(newPass));
+  ++g_recorder.currentRenderPass;
+
+  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
+  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
 }
 
 bool create_pass(uint32_t width, uint32_t height) {

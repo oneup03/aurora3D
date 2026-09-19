@@ -13,6 +13,9 @@
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
+#ifdef AURORA_ENABLE_LEIASR
+#  include "webgpu/leiasr.hpp"
+#endif
 #include <webgpu/webgpu_cpp.h>
 #endif
 
@@ -252,6 +255,10 @@ bool begin_frame() noexcept {
     }
   }
 
+  // Always start each frame on the left eye so set_efb_targets picks the left
+  // EFB for pass 0. Stereo painters call aurora_set_active_eye later to swap.
+  webgpu::g_activeEye = AURORA_EYE_LEFT;
+
   imgui::new_frame(window::get_window_size());
   if (!gfx::begin_frame()) {
     return false;
@@ -276,17 +283,19 @@ void end_frame() noexcept {
                                                            presentSource.size.width, presentSource.size.height);
 
   wgpu::BindGroup rmlBindGroup;
+  wgpu::BindGroup rmlOverlayBindGroup;
   bool rmlOverlay = false;
 #if AURORA_ENABLE_RMLUI
   if (rmlui::is_initialized()) {
     auto rmlFrame = rmlui::record_frame(viewport);
     rmlBindGroup = std::move(rmlFrame.bindGroup);
+    rmlOverlayBindGroup = std::move(rmlFrame.overlayBindGroup);
     rmlOverlay = rmlFrame.overlay;
   }
 #endif
 
-  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
-                  imguiDrawData = std::move(imguiDrawData)](
+  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlayBindGroup = std::move(rmlOverlayBindGroup),
+                  rmlOverlay, viewport, imguiDrawData = std::move(imguiDrawData)](
                      wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
     wgpu::Texture currentTexture;
     wgpu::TextureView currentView;
@@ -307,12 +316,139 @@ void end_frame() noexcept {
 
     const bool canPresent = currentTexture && currentView;
     if (canPresent) {
+      const bool stereo_active = webgpu::g_stereoCfg.mode != AURORA_STEREO_OFF;
+      {
+        // Compose parameters for the stereo-aware XFB copy shader. Mode 0
+        // (OFF) degenerates to a plain left-eye blit. The ghost-reduction
+        // levers are already forced to their no-ops by the caller when stereo
+        // is off (dusk::stereo::apply_config_from_settings).
+        const webgpu::StereoUboData stereoUboData{
+            .mode = static_cast<uint32_t>(webgpu::g_stereoCfg.mode),
+            .w = viewport.width,
+            .h = viewport.height,
+            .hudDepth = webgpu::g_stereoCfg.hudDepth,
+            .ghostContrast = webgpu::g_stereoCfg.ghostContrast,
+            .ghostBlackFloor = webgpu::g_stereoCfg.ghostBlackFloor,
+        };
+        g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &stereoUboData, sizeof(stereoUboData));
+      }
       wgpu::BindGroup presentBindGroup;
       if (rmlBindGroup && !rmlOverlay) {
+        // Mono backdrop-filter path: RmlUi composited the scene into its own
+        // target. record_frame forces the overlay path whenever stereo is on.
         presentBindGroup = rmlBindGroup;
-      } else {
+      } else if (!stereo_active) {
         const auto& resampledSource = webgpu::resample_present_source(encoder, viewport);
         presentBindGroup = webgpu::create_copy_bind_group(resampledSource);
+      } else {
+        // Resample each eye's EFB to the present viewport size. The stereo
+        // compose shader then samples both resampled textures and produces
+        // SbS / TaB / interlaced / checkerboard / anaglyph.
+        const auto& leftResampled = webgpu::resample_present_source_for(encoder, viewport, AURORA_EYE_LEFT);
+        const auto& rightResampled = webgpu::resample_present_source_for(encoder, viewport, AURORA_EYE_RIGHT);
+        presentBindGroup = webgpu::create_copy_bind_group_stereo(leftResampled, rightResampled);
+
+#ifdef AURORA_ENABLE_LEIASR
+        // LeiaSR autostereoscopic path: render SBS into a shared D3D12 texture,
+        // run the native SR weaver, then sample the woven result in the EFB-copy
+        // pass below. The flow needs an early Dawn submit so the weaver's native
+        // command list (executed on the same queue) sees the SBS write.
+        const bool leiasr_active = webgpu::g_stereoCfg.mode == AURORA_STEREO_LEIASR &&
+                                   webgpu::leiasr::is_supported() &&
+                                   webgpu::leiasr::ensure_ready(static_cast<uint32_t>(viewport.width),
+                                                                static_cast<uint32_t>(viewport.height),
+                                                                webgpu::g_graphicsConfig.surfaceConfiguration.format);
+        if (leiasr_active) {
+          // Force SBS mode in the StereoUbo just for the input-render pass so the
+          // existing compose shader produces a side-by-side image. Ghost
+          // reduction MUST be applied here, on the SbS intermediate, i.e.
+          // BEFORE the weave: residual ghosting on an SR panel is the weaver's
+          // own crosstalk cancellation clipping at 0/1, so the range has to be
+          // compressed on the pixels the weaver is about to read.
+          const webgpu::StereoUboData sbsUbo{
+              .mode = static_cast<uint32_t>(AURORA_STEREO_SBS),
+              .w = viewport.width,
+              .h = viewport.height,
+              .hudDepth = 0.0f,
+              .ghostContrast = webgpu::g_stereoCfg.ghostContrast,
+              .ghostBlackFloor = webgpu::g_stereoCfg.ghostBlackFloor,
+          };
+          g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &sbsUbo, sizeof(sbsUbo));
+
+          wgpu::TextureView sbsView = webgpu::leiasr::input_view();
+          if (sbsView) {
+            const auto sbsExtent = webgpu::leiasr::input_extent();
+            const std::array sbsAttachments{
+                wgpu::RenderPassColorAttachment{
+                    .view = sbsView,
+                    .loadOp = wgpu::LoadOp::Clear,
+                    .storeOp = wgpu::StoreOp::Store,
+                },
+            };
+            const wgpu::RenderPassDescriptor sbsPassDesc{
+                .label = "LeiaSR SBS compose pass",
+                .colorAttachmentCount = sbsAttachments.size(),
+                .colorAttachments = sbsAttachments.data(),
+            };
+            const auto sbsPass = encoder.BeginRenderPass(&sbsPassDesc);
+            sbsPass.SetPipeline(webgpu::g_CopyPipeline);
+            sbsPass.SetBindGroup(0, presentBindGroup, 0, nullptr);
+            // Viewport spans the full SBS texture (2x viewport.width) so the
+            // existing SBS shader writes each eye at its full resolution into
+            // its half of the input.
+            sbsPass.SetViewport(0.f, 0.f, static_cast<float>(sbsExtent.width),
+                                static_cast<float>(sbsExtent.height), 0.f, 1.f);
+            sbsPass.Draw(3);
+            sbsPass.End();
+
+            // Flush this encoder so the SBS write is visible to the native weaver.
+            const wgpu::CommandBufferDescriptor preDesc{.label = "LeiaSR pre-weave buffer"};
+            const auto preBuffer = encoder.Finish(&preDesc);
+            g_queue.Submit(1, &preBuffer);
+
+            webgpu::leiasr::weave();
+
+            // Restart a fresh encoder for the woven-output -> swapchain copy, UI
+            // overlay, and ImGui passes.
+            const wgpu::CommandEncoderDescriptor postEncDesc{.label = "LeiaSR post-weave encoder"};
+            encoder = g_device.CreateCommandEncoder(&postEncDesc);
+
+            // Reset the StereoUbo to mode 0 (OFF) so the EFB-copy below samples
+            // the woven texture cleanly through the case 0 branch (and the UI
+            // overlay lands as a plain screen-depth blit). Ghost reduction is
+            // left at its no-op defaults here -- it already ran on the SbS
+            // input above, and running it a second time on the woven output
+            // would double-compress the range.
+            const webgpu::StereoUboData monoUbo{
+                .mode = 0u, .w = viewport.width, .h = viewport.height, .hudDepth = 0.0f};
+            g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &monoUbo, sizeof(monoUbo));
+
+            // Replace presentBindGroup with one bound to the woven output.
+            presentBindGroup = webgpu::create_copy_bind_group(webgpu::leiasr::output_texture());
+          } else {
+            // Couldn't acquire the SBS input texture this frame; fall back to a
+            // plain mono compose so the user still sees something. No stereo
+            // means no crosstalk, so ghost reduction stays at its no-ops.
+            const webgpu::StereoUboData monoUbo{
+                .mode = 0u, .w = viewport.width, .h = viewport.height, .hudDepth = 0.0f};
+            g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &monoUbo, sizeof(monoUbo));
+          }
+        } else if (webgpu::g_stereoCfg.mode == AURORA_STEREO_LEIASR) {
+          // LeiaSR is selected but the weaver isn't available this frame: either
+          // its lazy render-thread init hasn't succeeded yet, or it latched
+          // Disabled (no SR display / SR service down). The stereo UBO was set
+          // to LEIASR above (mode has no branch in the compose shader), so
+          // rewrite it to mono and present a clean 2D (left-eye) image instead
+          // of feeding the shader an unhandled mode. Previously the config
+          // setter force-fell-back to OFF synchronously; that path did the
+          // SR init on the UI thread and deadlocked, so the fallback moved
+          // here where it costs one already-computed resample.
+          const webgpu::StereoUboData monoUbo{
+              .mode = 0u, .w = viewport.width, .h = viewport.height, .hudDepth = 0.0f};
+          g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &monoUbo, sizeof(monoUbo));
+          presentBindGroup = webgpu::create_copy_bind_group(leftResampled);
+        }
+#endif
       }
       {
         const std::array attachments{
@@ -336,9 +472,14 @@ void end_frame() noexcept {
                              webgpu::g_graphicsConfig.surfaceConfiguration.height);
 
         pass.Draw(3);
-        if (rmlBindGroup && rmlOverlay) {
-          pass.SetPipeline(webgpu::g_CopyPremultipliedAlphaPipeline);
-          pass.SetBindGroup(0, rmlBindGroup, 0, nullptr);
+        if (rmlOverlayBindGroup && rmlOverlay) {
+          // Alpha-blend the UI-only RmlUi target over the just-composited
+          // image. g_UIOverlayPipeline remaps UVs for SbS / TaB so the menu
+          // lands in each eye's half; in mono (and over the LeiaSR woven
+          // output, where the UBO mode was reset to 0) it is a plain
+          // premultiplied screen-depth blit.
+          pass.SetPipeline(webgpu::g_UIOverlayPipeline);
+          pass.SetBindGroup(0, rmlOverlayBindGroup, 0, nullptr);
           pass.Draw(3);
         }
         pass.End();
@@ -476,3 +617,72 @@ void aurora_set_resampler(AuroraSampler sampler) {
 }
 void aurora_set_timescale(float scale) { aurora::time::set_scale(scale); }
 float aurora_get_timescale() { return aurora::time::scale(); }
+
+void aurora_set_stereo_config(const AuroraStereoConfig* cfg) {
+#ifdef AURORA_ENABLE_GX
+  if (cfg == nullptr) {
+    return;
+  }
+  aurora::webgpu::g_stereoCfg = *cfg;
+  // Runs on the UI/main thread. aurora_stereo_mode_supported(LEIASR) is now a
+  // cheap DLL-presence probe -- it must NOT trigger the real SR weaver init
+  // here (that deadlocks; see leiasr::try_init). If the LeiaSR Platform DLLs
+  // aren't installed we fall back to OFF now; if they are, we keep LEIASR and
+  // the render worker lazily inits the weaver on the present path, falling back
+  // to a mono compose for as long as the weaver isn't actually ready (e.g. no
+  // SR display connected).
+  if (!aurora_stereo_mode_supported(aurora::webgpu::g_stereoCfg.mode)) {
+    aurora::webgpu::g_stereoCfg.mode = AURORA_STEREO_OFF;
+  }
+#endif
+}
+
+void aurora_set_active_eye(AuroraEye eye) {
+#ifdef AURORA_ENABLE_GX
+  if (aurora::webgpu::g_activeEye == eye) {
+    return;
+  }
+  // Flush whatever the current eye has accumulated into its render pass,
+  // then start a fresh EFB pass tagged to the new eye.
+  aurora::gx::fifo::drain();
+  aurora::webgpu::g_activeEye = eye;
+  aurora::gfx::begin_new_efb_pass_for_active_eye();
+#else
+  (void)eye;
+#endif
+}
+
+AuroraEye aurora_get_active_eye() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::webgpu::g_activeEye;
+#else
+  return AURORA_EYE_LEFT;
+#endif
+}
+
+bool aurora_stereo_mode_supported(AuroraStereoMode mode) {
+  switch (mode) {
+  case AURORA_STEREO_OFF:
+  case AURORA_STEREO_SBS:
+  case AURORA_STEREO_TAB:
+  case AURORA_STEREO_ROW_INTERLACED:
+  case AURORA_STEREO_COL_INTERLACED:
+  case AURORA_STEREO_CHECKERBOARD:
+  case AURORA_STEREO_ANAGLYPH:
+    return true;
+  case AURORA_STEREO_LEIASR:
+#if defined(AURORA_ENABLE_LEIASR) && defined(AURORA_ENABLE_GX)
+    // Cheap DLL-presence probe ONLY. This function is called from the UI/main
+    // thread (settings dropdown gating + aurora_set_stereo_config below), where
+    // the heavyweight is_supported()/try_init() path must never run -- it
+    // deadlocks the SR runtime's window-proc re-entrancy and races the render
+    // worker's own lazy init. The real weaver/display init happens on the
+    // render thread via the present path (see leiasr::try_init's contract).
+    return aurora::webgpu::leiasr::is_runtime_installed();
+#else
+    return false;
+#endif
+  default:
+    return false;
+  }
+}

@@ -56,6 +56,11 @@ void end_color_pass();
 void queue_texture_copy(wgpu::TexelCopyTextureInfo src, wgpu::TexelCopyTextureInfo dst, wgpu::Extent3D size);
 void begin_offscreen(uint32_t width, uint32_t height);
 void end_offscreen();
+// Stereo: seal the current EFB pass and start a fresh one bound to the
+// buffers of webgpu::g_activeEye. The caller is responsible for draining the
+// GX FIFO first. Only valid between begin/end frame and outside offscreen
+// rendering; a no-op or a warning otherwise.
+void begin_new_efb_pass_for_active_eye();
 bool has_normal_attachment() noexcept;
 RenderTargetLayout get_render_target_layout() noexcept;
 void clear_caches() noexcept;
