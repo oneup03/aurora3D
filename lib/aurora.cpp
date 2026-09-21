@@ -333,6 +333,9 @@ void end_frame() noexcept {
         g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &stereoUboData, sizeof(stereoUboData));
       }
       wgpu::BindGroup presentBindGroup;
+      // Set when presentBindGroup holds the LeiaSR weaver's output, which is
+      // panel-sized and carries its own letterbox (see the weave path below).
+      bool wovenPresent = false;
       if (rmlBindGroup && !rmlOverlay) {
         // Mono backdrop-filter path: RmlUi composited the scene into its own
         // target. record_frame forces the overlay path whenever stereo is on.
@@ -353,20 +356,46 @@ void end_frame() noexcept {
         // run the native SR weaver, then sample the woven result in the EFB-copy
         // pass below. The flow needs an early Dawn submit so the weaver's native
         // command list (executed on the same queue) sees the SBS write.
+        //
+        // The weave target is sized to the PANEL, not to the content viewport.
+        // A lenticular weave is only valid on the pixel grid it was computed
+        // for: the lens assigns each physical column to an eye, so blitting a
+        // woven image to the swap chain at any offset shifts every column into
+        // a neighbouring lobe and the eyes swap. calculate_present_viewport's
+        // `left` is (surface_width - viewport_width) / 2, which moves with the
+        // EFB size and therefore with the internal resolution scale -- so a
+        // resolution change alone was enough to inject that offset and invert
+        // the image. Weaving at panel size and blitting 1:1 removes the offset
+        // from the equation entirely; the letterbox is composed into the SbS
+        // input below instead, so it comes out the far side of the weave as
+        // correctly-woven black bars.
+        const uint32_t panelWidth = webgpu::g_graphicsConfig.surfaceConfiguration.width;
+        const uint32_t panelHeight = webgpu::g_graphicsConfig.surfaceConfiguration.height;
         const bool leiasr_active = webgpu::g_stereoCfg.mode == AURORA_STEREO_LEIASR &&
                                    webgpu::leiasr::is_supported() &&
-                                   webgpu::leiasr::ensure_ready(static_cast<uint32_t>(viewport.width),
-                                                                static_cast<uint32_t>(viewport.height),
+                                   webgpu::leiasr::ensure_ready(panelWidth, panelHeight,
                                                                 webgpu::g_graphicsConfig.surfaceConfiguration.format);
         if (leiasr_active) {
-          // Force SBS mode in the StereoUbo just for the input-render pass so the
-          // existing compose shader produces a side-by-side image. Ghost
-          // reduction MUST be applied here, on the SbS intermediate, i.e.
-          // BEFORE the weave: residual ghosting on an SR panel is the weaver's
-          // own crosstalk cancellation clipping at 0/1, so the range has to be
-          // compressed on the pixels the weaver is about to read.
+          // Each half of the SbS input is now a full panel-sized view, and the
+          // eye image has to sit inside it exactly where it will appear on the
+          // panel -- bars included. One SbS draw can't express that: the SbS
+          // branch splits on uv.x >= 0.5 across whatever viewport it is given,
+          // and the two content rects (one per half) aren't contiguous, so no
+          // single viewport covers both without also covering the gap between
+          // them. Two mono draws, each scissored to its own half's content
+          // rect, place them directly.
+          //
+          // Mode OFF rather than SBS for those draws: the compose shader's
+          // case 0 samples efb_texture_left, and create_copy_bind_group binds
+          // the same texture to both slots, so each draw resolves to "blit
+          // this one eye". Ghost reduction still applies -- ghost_reduce()
+          // wraps the switch's result for every mode -- and it MUST, here on
+          // the SbS intermediate, BEFORE the weave: residual ghosting on an SR
+          // panel is the weaver's own crosstalk cancellation clipping at 0/1,
+          // so the range has to be compressed on the pixels the weaver is
+          // about to read.
           const webgpu::StereoUboData sbsUbo{
-              .mode = static_cast<uint32_t>(AURORA_STEREO_SBS),
+              .mode = 0u,
               .w = viewport.width,
               .h = viewport.height,
               .hudDepth = 0.0f,
@@ -377,7 +406,12 @@ void end_frame() noexcept {
 
           wgpu::TextureView sbsView = webgpu::leiasr::input_view();
           if (sbsView) {
+            // The two draws below place content by hand at panel coordinates,
+            // so they and ensure_ready() must agree on what the halves are.
             const auto sbsExtent = webgpu::leiasr::input_extent();
+            AURORA_ASSERT(sbsExtent.width == panelWidth * 2u && sbsExtent.height == panelHeight,
+                          "LeiaSR SbS input is {}x{}, expected {}x{}", sbsExtent.width, sbsExtent.height,
+                          panelWidth * 2u, panelHeight);
             const std::array sbsAttachments{
                 wgpu::RenderPassColorAttachment{
                     .view = sbsView,
@@ -392,13 +426,17 @@ void end_frame() noexcept {
             };
             const auto sbsPass = encoder.BeginRenderPass(&sbsPassDesc);
             sbsPass.SetPipeline(webgpu::g_CopyPipeline);
-            sbsPass.SetBindGroup(0, presentBindGroup, 0, nullptr);
-            // Viewport spans the full SBS texture (2x viewport.width) so the
-            // existing SBS shader writes each eye at its full resolution into
-            // its half of the input.
-            sbsPass.SetViewport(0.f, 0.f, static_cast<float>(sbsExtent.width),
-                                static_cast<float>(sbsExtent.height), 0.f, 1.f);
-            sbsPass.Draw(3);
+            // LoadOp::Clear above already black-filled both halves, so anything
+            // these two draws don't cover stays as the letterbox bars.
+            const auto leftEyeBindGroup = webgpu::create_copy_bind_group(leftResampled);
+            const auto rightEyeBindGroup = webgpu::create_copy_bind_group(rightResampled);
+            for (uint32_t half = 0; half < 2; ++half) {
+              const float halfOrigin = static_cast<float>(half * panelWidth);
+              sbsPass.SetBindGroup(0, half == 0 ? leftEyeBindGroup : rightEyeBindGroup, 0, nullptr);
+              sbsPass.SetViewport(halfOrigin + viewport.left, viewport.top, viewport.width, viewport.height,
+                                  0.f, 1.f);
+              sbsPass.Draw(3);
+            }
             sbsPass.End();
 
             // Flush this encoder so the SBS write is visible to the native weaver.
@@ -425,6 +463,7 @@ void end_frame() noexcept {
 
             // Replace presentBindGroup with one bound to the woven output.
             presentBindGroup = webgpu::create_copy_bind_group(webgpu::leiasr::output_texture());
+            wovenPresent = true;
           } else {
             // Couldn't acquire the SBS input texture this frame; fall back to a
             // plain mono compose so the user still sees something. No stereo
@@ -468,11 +507,26 @@ void end_frame() noexcept {
         // Copy EFB -> XFB (swapchain)
         pass.SetPipeline(webgpu::g_CopyPipeline);
         pass.SetBindGroup(0, presentBindGroup, 0, nullptr);
-        set_present_viewport(pass, viewport, webgpu::g_graphicsConfig.surfaceConfiguration.width,
-                             webgpu::g_graphicsConfig.surfaceConfiguration.height);
+        const uint32_t surfaceWidth = webgpu::g_graphicsConfig.surfaceConfiguration.width;
+        const uint32_t surfaceHeight = webgpu::g_graphicsConfig.surfaceConfiguration.height;
+        if (wovenPresent) {
+          // 1:1, origin 0. Every column of a woven image belongs to a specific
+          // physical panel column; an offset or a rescale here reassigns them
+          // and the eyes swap. The letterbox is already inside this texture.
+          pass.SetViewport(0.f, 0.f, static_cast<float>(surfaceWidth), static_cast<float>(surfaceHeight), 0.f,
+                           1.f);
+          pass.SetScissorRect(0, 0, surfaceWidth, surfaceHeight);
+        } else {
+          set_present_viewport(pass, viewport, surfaceWidth, surfaceHeight);
+        }
 
         pass.Draw(3);
         if (rmlOverlayBindGroup && rmlOverlay) {
+          if (wovenPresent) {
+            // The UI is a flat overlay on the swap chain, not woven content, so
+            // it keeps the aspect-correct placement it has in every other mode.
+            set_present_viewport(pass, viewport, surfaceWidth, surfaceHeight);
+          }
           // Alpha-blend the UI-only RmlUi target over the just-composited
           // image. g_UIOverlayPipeline remaps UVs for SbS / TaB so the menu
           // lands in each eye's half; in mono (and over the LeiaSR woven
