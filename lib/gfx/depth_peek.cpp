@@ -79,6 +79,7 @@ wgpu::ComputePipeline g_pipeline;
 bool g_snapshotRequested = false;
 Clock::time_point g_nextSnapshotTime;
 LatestSnapshot g_latest;
+uint64_t g_latestGeneration = 0;
 std::mutex g_mutex;
 
 constexpr std::string_view ShaderPreamble = R"(
@@ -296,6 +297,7 @@ void complete_slot(size_t slotIdx, wgpu::MapAsyncStatus status, wgpu::StringView
       g_latest.width = slot.width;
       g_latest.height = slot.height;
       g_latest.data.assign(mapped, mapped + valueCount);
+      ++g_latestGeneration;
     }
     slot.readbackBuffer.Unmap();
   } else if (status != wgpu::MapAsyncStatus::CallbackCancelled && status != wgpu::MapAsyncStatus::Aborted) {
@@ -338,6 +340,72 @@ bool read_latest(uint16_t x, uint16_t y, uint32_t& z) noexcept {
   }
   z = g_latest.data[static_cast<size_t>(y) * g_latest.width + x] & 0x00ffffffu;
   return true;
+}
+
+uint64_t latest_generation() noexcept {
+  std::lock_guard lock{g_mutex};
+  return g_latestGeneration;
+}
+
+uint64_t reduce_min_blocks(float x0, float y0, float x1, float y1, uint32_t cols, uint32_t rows,
+                           uint32_t* out) noexcept {
+  if (out == nullptr || cols == 0 || rows == 0) {
+    return 0;
+  }
+
+  std::lock_guard lock{g_mutex};
+  const uint32_t width = g_latest.width;
+  const uint32_t height = g_latest.height;
+  if (width == 0 || height == 0 || g_latest.data.size() < static_cast<size_t>(width) * height) {
+    return 0;
+  }
+
+  // Normalized region -> texel bounds, clamped so every block gets >= 1 texel.
+  // Requesting more blocks than there are texels degenerates to one texel per
+  // block rather than to empty blocks.
+  const auto span = [](float a, float b, uint32_t extent, uint32_t blocks, uint32_t& lo,
+                       uint32_t& hi) {
+    const float lof = std::clamp(std::min(a, b), 0.f, 1.f) * static_cast<float>(extent);
+    const float hif = std::clamp(std::max(a, b), 0.f, 1.f) * static_cast<float>(extent);
+    lo = std::min(static_cast<uint32_t>(lof), extent - 1);
+    hi = std::clamp(static_cast<uint32_t>(hif), lo + 1, extent);
+    if (hi - lo < blocks) {
+      // Widen toward the far edge first, then the near one, so a tiny region
+      // still yields distinct blocks instead of aliasing onto one texel.
+      hi = std::min(lo + blocks, extent);
+      lo = (hi > blocks) ? std::min(lo, hi - blocks) : 0;
+    }
+  };
+
+  uint32_t sx0 = 0, sx1 = 0, sy0 = 0, sy1 = 0;
+  span(x0, x1, width, cols, sx0, sx1);
+  span(y0, y1, height, rows, sy0, sy1);
+
+  const uint32_t spanX = sx1 - sx0;
+  const uint32_t spanY = sy1 - sy0;
+  const uint32_t* const data = g_latest.data.data();
+
+  for (uint32_t r = 0; r < rows; ++r) {
+    // Integer edges so consecutive blocks tile the span with no gap or overlap.
+    const uint32_t by0 = sy0 + static_cast<uint32_t>(static_cast<uint64_t>(spanY) * r / rows);
+    const uint32_t by1 = sy0 + static_cast<uint32_t>(static_cast<uint64_t>(spanY) * (r + 1) / rows);
+    for (uint32_t c = 0; c < cols; ++c) {
+      const uint32_t bx0 = sx0 + static_cast<uint32_t>(static_cast<uint64_t>(spanX) * c / cols);
+      const uint32_t bx1 = sx0 + static_cast<uint32_t>(static_cast<uint64_t>(spanX) * (c + 1) / cols);
+      uint32_t best = 0x00ffffffu;
+      for (uint32_t y = by0; y < by1; ++y) {
+        const uint32_t* row = data + static_cast<size_t>(y) * width;
+        for (uint32_t x = bx0; x < bx1; ++x) {
+          const uint32_t z = row[x] & 0x00ffffffu;
+          if (z < best) {
+            best = z;
+          }
+        }
+      }
+      out[static_cast<size_t>(r) * cols + c] = best;
+    }
+  }
+  return g_latestGeneration;
 }
 
 void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
@@ -462,6 +530,7 @@ void reset() noexcept {
   g_nextSlot = 0;
   g_nextSnapshotTime = {};
   g_latest = {};
+  g_latestGeneration = 0;
   for (auto& slot : g_slots) {
     slot.state = SlotState::Available;
   }
@@ -477,6 +546,7 @@ void set_latest(uint32_t width, uint32_t height, const std::vector<uint32_t>& da
   g_latest.width = width;
   g_latest.height = height;
   g_latest.data = data;
+  ++g_latestGeneration;
 }
 } // namespace testing
 

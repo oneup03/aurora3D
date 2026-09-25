@@ -18,6 +18,53 @@ include(CMakeDependentOption)
 cmake_dependent_option(AURORA_ENABLE_EXAMPLES "Enable examples" ON "CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR" OFF)
 cmake_dependent_option(AURORA_ENABLE_TESTS "Enable tests" ON "NOT CMAKE_CROSSCOMPILING" OFF)
 
+# LeiaSR autostereoscopic weaving (Windows x64 + D3D12 backend only).
+#
+# The SR SDK is not on any package index, so it is vendored through the
+# bo3b/SR-lib submodule (api_expansion branch) at extern/SR-lib. Its CMakeLists
+# locates the nested per-architecture SDK tree, exposes SRLib::SDK (headers +
+# import libs) and SRLib::SR (that, plus SR.cpp's SRInterface* wrapper), and
+# provides srlib_apply_delayload() carrying the complete /DELAYLOAD list. Our
+# lib/webgpu/leiasr.cpp drives the wrapper, so aurora_core links SRLib::SR.
+#
+# Deliberately not find_package(simulatedreality): the SDK's own CMake configs
+# declare their targets SHARED IMPORTED and CMake then demands the runtime
+# bin/*.dll sit next to each .lib. SR-lib ships import libraries only -- the
+# DLLs belong to the user's system-wide SR Platform install and must not be
+# redistributed -- so find_package fails with a misleading "The installation
+# package was faulty".
+#
+# SRLIB_FOUND comes back FALSE on non-Windows and when the (private) submodule
+# was never checked out, so a clone without SR-lib access still configures and
+# builds; LeiaSR just isn't offered and the game falls back to the other stereo
+# modes.
+#
+# The SR SDK ships x64 (and x86) Windows import libraries only -- there is no
+# ARM64 build of the SR runtime -- so LeiaSR must be excluded on Windows-on-ARM
+# targets. Detect the TARGET arch (not the host): MSVC populates
+# CMAKE_CXX_COMPILER_ARCHITECTURE_ID (ARM / ARM64 / ARM64EC / X86 / x64), and
+# CMAKE_SYSTEM_PROCESSOR (ARM64 / AMD64 / ...) is the fallback for other
+# toolchains.
+set(_leiasr_is_arm FALSE)
+if (CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "[Aa][Rr][Mm]" OR
+    CMAKE_SYSTEM_PROCESSOR MATCHES "[Aa][Rr][Mm]")
+  set(_leiasr_is_arm TRUE)
+endif ()
+
+set(SRLIB_FOUND FALSE)
+if (WIN32 AND NOT _leiasr_is_arm AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/SR-lib/CMakeLists.txt")
+  add_subdirectory(extern/SR-lib)
+endif ()
+
+# Cached (not a plain variable) so consumers that add_subdirectory() aurora --
+# e.g. dusklight, which needs to know whether to call srlib_apply_delayload() on
+# its executable -- can see it from their own scope. Re-derived every configure
+# so a stale cache from a build where the submodule was missing doesn't stick.
+set(AURORA_ENABLE_LEIASR ${SRLIB_FOUND} CACHE INTERNAL "LeiaSR autostereoscopic output is available")
+if (AURORA_ENABLE_LEIASR)
+  message(STATUS "aurora: LeiaSR enabled (${SRLIB_SDKROOT})")
+endif ()
+
 # Dependency versions
 include(cmake/AuroraDependencyVersions.cmake)
 

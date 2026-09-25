@@ -26,6 +26,45 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      # extern/SR-lib is the LeiaSR (Simulated Reality) SDK -- a private
+      # third-party repo (bo3b/SR-lib), and Windows-only. Without a PAT that can
+      # read it, or on a non-Windows runner, it stays unchecked-out and
+      # CMakeLists leaves AURORA_ENABLE_LEIASR off; everything else still builds.
+      # The Windows leg with the secret present is what actually compiles
+      # lib/webgpu/leiasr.cpp.
+      - name: Init submodules
+        shell: bash
+        env:
+          SUBMODULE_PAT: ${{ secrets.SHARED_PAT || secrets.SUBMODULE_PAT }}
+        run: |
+          set -euo pipefail
+
+          if [ "${RUNNER_OS}" != "Windows" ] || [ -z "$SUBMODULE_PAT" ]; then
+            if [ "${RUNNER_OS}" = "Windows" ]; then
+              echo "::warning::No SHARED_PAT/SUBMODULE_PAT secret available; building without the LeiaSR SDK."
+            fi
+            git config submodule."extern/SR-lib".update none
+            git submodule update --init --recursive
+            exit 0
+          fi
+
+          # actions/checkout writes an http.https://github.com/.extraheader token
+          # scoped to this repo that git applies to every github.com URL, which
+          # 401s against bo3b/SR-lib. It has to come out first, or a perfectly
+          # good PAT looks broken.
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          # Must be --global: `git submodule update` spawns a separate `git clone`
+          # process that never reads this repo's local config, so a --local
+          # rewrite is silently ignored and the private clone falls back to
+          # unauthenticated.
+          git config --global \
+            url."https://x-access-token:${SUBMODULE_PAT}@github.com/".insteadOf "https://github.com/"
+          git submodule update --init --recursive
+          git config --global --remove-section \
+            url."https://x-access-token:${SUBMODULE_PAT}@github.com/" || true
 
       - name: Install dependencies (Ubuntu)
         if: ${{ matrix.os == 'ubuntu-latest' }}
