@@ -49,6 +49,20 @@ TextureWithSampler g_frameBuffer;
 TextureWithSampler g_frameBufferResolved;
 TextureWithSampler g_depthBuffer;
 TextureWithSampler g_normalBuffer;
+TextureWithSampler g_frameBufferRight;
+TextureWithSampler g_normalBufferRight;
+TextureWithSampler g_frameBufferResolvedRight;
+TextureWithSampler g_depthBufferRight;
+AuroraStereoConfig g_stereoCfg{
+    .mode = AURORA_STEREO_OFF,
+    .eyeSeparation = 0.06f,
+    .convergence = 5.0f,
+    .hudDepth = 0.0f,
+    .refractionAmplitudeScale = 1.0f,
+    .ghostContrast = 1.0f,
+    .ghostBlackFloor = 0.0f,
+};
+AuroraEye g_activeEye = AURORA_EYE_LEFT;
 
 // EFB -> XFB copy pipeline
 static wgpu::BindGroupLayout g_CopyBindGroupLayout;
@@ -60,6 +74,13 @@ static wgpu::BindGroupLayout g_ResampleBindGroupLayout;
 static wgpu::RenderPipeline g_ResamplePipeline;
 static wgpu::Buffer g_ResampleUniformBuffer;
 static TextureWithSampler g_resampledFrameBuffer;
+static TextureWithSampler g_resampledFrameBufferRight;
+
+wgpu::Buffer g_StereoUbo;
+
+// UI overlay pipeline (alpha-blends a single RGBA texture over the swapchain)
+static wgpu::BindGroupLayout g_UIOverlayBindGroupLayout;
+wgpu::RenderPipeline g_UIOverlayPipeline;
 
 static wgpu::Adapter g_adapter;
 wgpu::Instance g_instance;
@@ -320,6 +341,13 @@ const TextureWithSampler& present_source() noexcept {
   return g_graphicsConfig.msaaSamples > 1 ? g_frameBufferResolved : g_frameBuffer;
 }
 
+const TextureWithSampler& present_source_for(AuroraEye eye) noexcept {
+  if (eye == AURORA_EYE_RIGHT) {
+    return g_graphicsConfig.msaaSamples > 1 ? g_frameBufferResolvedRight : g_frameBufferRight;
+  }
+  return present_source();
+}
+
 void set_resampler(AuroraSampler sampler) noexcept {
   switch (sampler) {
   case SAMPLER_AREA:
@@ -431,6 +459,9 @@ bool enable_normal_buffer() {
     return false;
   }
   g_normalBuffer = create_normal_texture(g_frameBuffer.size.width, g_frameBuffer.size.height);
+  // The right eye renders its own EFB pass, so it needs its own normal
+  // attachment -- sharing one would let the second eye overwrite the first.
+  g_normalBufferRight = create_normal_texture(g_frameBuffer.size.width, g_frameBuffer.size.height);
   g_graphicsConfig.normalBuffer = true;
   return true;
 }
@@ -438,10 +469,25 @@ bool enable_normal_buffer() {
 void create_copy_pipeline() {
   wgpu::ShaderSourceWGSL sourceDescriptor{};
   sourceDescriptor.code = R"""(
+struct StereoUbo {
+    mode: u32,
+    w: f32,
+    h: f32,
+    hudDepth: f32,
+    ghostContrast: f32,
+    ghostBlackFloor: f32,
+    _pad0: f32,
+    _pad1: f32,
+};
+
 @group(0) @binding(0)
 var efb_sampler: sampler;
 @group(0) @binding(1)
-var efb_texture: texture_2d<f32>;
+var efb_texture_left: texture_2d<f32>;
+@group(0) @binding(2)
+var efb_texture_right: texture_2d<f32>;
+@group(0) @binding(3)
+var<uniform> stereo: StereoUbo;
 
 struct VertexOutput {
     @builtin(position) pos: vec4<f32>,
@@ -467,15 +513,107 @@ fn vs_main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
     return out;
 }
 
+// Ghost / crosstalk range compression. Runs LAST, on the composed pixel, so
+// what gets compressed is exactly what reaches the panel.
+//
+// SPACE: this operates on the values as encoded, with no linearize/re-encode
+// pair around it, and that is deliberate -- the swap-chain format is forced
+// to a non-sRGB UNORM (see best_surface_format/to_linear), so the EFB content
+// this shader samples is already display-encoded, and the LeiaSR weaver is
+// initialized with SetShaderSRGBConversion(false, false) (leiasr.cpp), i.e.
+// its own crosstalk cancellation reads and writes those same encoded values.
+// The correction has to live in whatever space the display's cancellation
+// lives in; if either of those two facts changes, wrap this in
+// pow(c, 2.2) / pow(c, 1/2.2) so the two stay consistent.
+//
+// contrast == 1.0 and blackFloor == 0.0 are exact no-ops and are branched
+// out, so the untouched path stays bit-exact and free.
+fn ghost_reduce(c: vec3<f32>) -> vec3<f32> {
+    if (stereo.ghostContrast == 1.0 && stereo.ghostBlackFloor == 0.0) {
+        return c;
+    }
+    var v = saturate(c);
+    // Squeeze toward mid-grey: shrinks |L - R| and leaves headroom at both
+    // ends of the range.
+    v = (v - vec3<f32>(0.5)) * stereo.ghostContrast + vec3<f32>(0.5);
+    // Raise the black floor, leave white alone: foot-room for a cancelling
+    // display's subtraction, which would otherwise clip at 0 and leave the
+    // clipped part visible as a ghost.
+    v = v * (1.0 - stereo.ghostBlackFloor) + vec3<f32>(stereo.ghostBlackFloor);
+    return saturate(v);
+}
+
 @fragment
-fn fs_opaque(in: VertexOutput) -> @location(0) vec4<f32> {
-    let color = textureSample(efb_texture, efb_sampler, in.uv);
-    return vec4(color.rgb, 1.0);
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    // Sample the EFBs up front in uniform control flow. Pre-compute the
+    // remapped UVs for SbS / TaB so the right-half / bottom-half samples
+    // line up. Reads are cheap; the alternative is textureSampleLevel,
+    // which loses sampler-derived mipping (we have none) but still must
+    // be used unconditionally on this hardware path.
+    let halfX = select(uv.x * 2.0, (uv.x - 0.5) * 2.0, uv.x >= 0.5);
+    let halfY = select(uv.y * 2.0, (uv.y - 0.5) * 2.0, uv.y >= 0.5);
+    let l_full = textureSample(efb_texture_left, efb_sampler, uv).rgb;
+    let r_full = textureSample(efb_texture_right, efb_sampler, uv).rgb;
+    let l_sbs = textureSample(efb_texture_left, efb_sampler, vec2<f32>(halfX, uv.y)).rgb;
+    let r_sbs = textureSample(efb_texture_right, efb_sampler, vec2<f32>(halfX, uv.y)).rgb;
+    let l_tab = textureSample(efb_texture_left, efb_sampler, vec2<f32>(uv.x, halfY)).rgb;
+    let r_tab = textureSample(efb_texture_right, efb_sampler, vec2<f32>(uv.x, halfY)).rgb;
+
+    let row: u32 = u32(floor(uv.y * stereo.h));
+    let col: u32 = u32(floor(uv.x * stereo.w));
+
+    var color: vec3<f32>;
+    switch stereo.mode {
+        // AURORA_STEREO_OFF
+        case 0u: {
+            color = l_full;
+        }
+        // AURORA_STEREO_SBS
+        case 1u: {
+            color = select(l_sbs, r_sbs, uv.x >= 0.5);
+        }
+        // AURORA_STEREO_TAB
+        case 2u: {
+            color = select(l_tab, r_tab, uv.y >= 0.5);
+        }
+        // AURORA_STEREO_ROW_INTERLACED
+        case 3u: {
+            color = select(l_full, r_full, (row & 1u) == 1u);
+        }
+        // AURORA_STEREO_COL_INTERLACED
+        case 4u: {
+            color = select(l_full, r_full, (col & 1u) == 1u);
+        }
+        // AURORA_STEREO_CHECKERBOARD
+        case 5u: {
+            color = select(l_full, r_full, ((row ^ col) & 1u) == 1u);
+        }
+        // AURORA_STEREO_ANAGLYPH (Dubois red/cyan)
+        case 6u: {
+            let mL = mat3x3<f32>(
+                 0.456, -0.040, -0.015,
+                 0.500, -0.038, -0.021,
+                 0.176, -0.016, -0.005,
+            );
+            let mR = mat3x3<f32>(
+                -0.043,  0.378, -0.072,
+                -0.088,  0.461, -0.250,
+                -0.002,  0.048,  0.456,
+            );
+            color = saturate(mL * l_full + mR * r_full);
+        }
+        // AURORA_STEREO_LEIASR (Phase 2 - fall through to mono left for now)
+        default: {
+            color = l_full;
+        }
+    }
+    return vec4<f32>(ghost_reduce(color), 1.0);
 }
 
 @fragment
 fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(efb_texture, efb_sampler, in.uv);
+    return textureSample(efb_texture_left, efb_sampler, in.uv);
 }
 )""";
   const wgpu::ShaderModuleDescriptor moduleDescriptor{
@@ -499,6 +637,24 @@ fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
               wgpu::TextureBindingLayout{
                   .sampleType = wgpu::TextureSampleType::Float,
                   .viewDimension = wgpu::TextureViewDimension::e2D,
+              },
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 2,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture =
+              wgpu::TextureBindingLayout{
+                  .sampleType = wgpu::TextureSampleType::Float,
+                  .viewDimension = wgpu::TextureViewDimension::e2D,
+              },
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 3,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .buffer =
+              wgpu::BufferBindingLayout{
+                  .type = wgpu::BufferBindingType::Uniform,
+                  .minBindingSize = kStereoUboSize,
               },
       },
   };
@@ -547,7 +703,7 @@ fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
     };
     return g_device.CreateRenderPipeline(&pipelineDescriptor);
   };
-  g_CopyPipeline = make_copy_pipeline("XFB Copy Pipeline", "fs_opaque", nullptr);
+  g_CopyPipeline = make_copy_pipeline("XFB Copy Pipeline", "fs_main", nullptr);
 
   const wgpu::BlendState premultipliedAlphaBlend{
       .color =
@@ -565,6 +721,185 @@ fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
   };
   g_CopyPremultipliedAlphaPipeline =
       make_copy_pipeline("XFB Premultiplied Alpha Copy Pipeline", "fs_premultiplied_alpha", &premultipliedAlphaBlend);
+
+  // Stereo uniform buffer. 32 bytes: mode, w, h, hudDepth, ghostContrast,
+  // ghostBlackFloor + 8 bytes of tail padding -- WGSL rounds a uniform-address-
+  // space struct up to a 16-byte multiple, so the six live scalars (24 bytes)
+  // must be padded to 32. Keep this in sync with kStereoUboSize and with BOTH
+  // WGSL `StereoUbo` declarations (compose + UI overlay).
+  const wgpu::BufferDescriptor stereoUboDescriptor{
+      .label = "Stereo UBO",
+      .usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+      .size = kStereoUboSize,
+  };
+  g_StereoUbo = g_device.CreateBuffer(&stereoUboDescriptor);
+}
+
+static void create_ui_overlay_pipeline() {
+  wgpu::ShaderSourceWGSL sourceDescriptor{};
+  sourceDescriptor.code = R"""(
+// Must mirror the compose shader's StereoUbo exactly -- both bind the same
+// 32-byte g_StereoUbo. The overlay deliberately ignores the ghost-reduction
+// fields: the rmlui overlay sits at screen depth (zero parallax) and so has
+// no inter-eye difference to ghost, while the in-game J2D HUD arrives through
+// the EFB and is already covered by the compose pass.
+struct StereoUbo {
+    mode: u32,
+    w: f32,
+    h: f32,
+    hudDepth: f32,
+    ghostContrast: f32,
+    ghostBlackFloor: f32,
+    _pad0: f32,
+    _pad1: f32,
+};
+
+@group(0) @binding(0) var ui_sampler: sampler;
+@group(0) @binding(1) var ui_texture: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> stereo: StereoUbo;
+
+struct VertexOutput {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
+    vec2(-1.0, 1.0),
+    vec2(-1.0, -3.0),
+    vec2(3.0, 1.0),
+);
+var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
+    vec2(0.0, 0.0),
+    vec2(0.0, 2.0),
+    vec2(2.0, 0.0),
+);
+
+@vertex
+fn vs_main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
+    var out: VertexOutput;
+    out.pos = vec4<f32>(pos[vtxIdx], 0.0, 1.0);
+    out.uv = uvs[vtxIdx];
+    return out;
+}
+
+// rmlui overlay (settings menus / pre-launch UI) renders at screen depth in
+// every stereo mode -- HUD Depth is a separate slider that targets only the
+// in-game J2D HUD (hearts, rupees, button hints, mini-map). The shader still
+// remaps UVs in SbS/TaB so the menu fits each half of the swapchain, but
+// applies no per-eye parallax. stereo.hudDepth is intentionally unused here.
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    let halfX = select(uv.x * 2.0, (uv.x - 0.5) * 2.0, uv.x >= 0.5);
+    let halfY = select(uv.y * 2.0, (uv.y - 0.5) * 2.0, uv.y >= 0.5);
+
+    switch stereo.mode {
+        // AURORA_STEREO_SBS - each half shows full UI, scaled
+        case 1u: {
+            return textureSample(ui_texture, ui_sampler, vec2<f32>(halfX, uv.y));
+        }
+        // AURORA_STEREO_TAB - each half shows full UI, vertically scaled
+        case 2u: {
+            return textureSample(ui_texture, ui_sampler, vec2<f32>(uv.x, halfY));
+        }
+        // Off / Row / Column / Checker / Anaglyph / LeiaSR - single sample at
+        // screen UV. The rmlui overlay sits at screen depth and the user's
+        // anaglyph/interlaced display reproduces it without per-eye offset.
+        default: {
+            return textureSample(ui_texture, ui_sampler, uv);
+        }
+    }
+}
+)""";
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{
+      .nextInChain = &sourceDescriptor,
+      .label = "UI Overlay Module",
+  };
+  auto module = g_device.CreateShaderModule(&moduleDescriptor);
+
+  // Upstream's RmlUi render path now produces premultiplied-alpha output, so
+  // blend with One / OneMinusSrcAlpha (not SrcAlpha) when overlaying the UI.
+  const wgpu::BlendState blendState{
+      .color =
+          {
+              .operation = wgpu::BlendOperation::Add,
+              .srcFactor = wgpu::BlendFactor::One,
+              .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha,
+          },
+      .alpha =
+          {
+              .operation = wgpu::BlendOperation::Add,
+              .srcFactor = wgpu::BlendFactor::One,
+              .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha,
+          },
+  };
+  const std::array colorTargets{wgpu::ColorTargetState{
+      .format = g_graphicsConfig.surfaceConfiguration.format,
+      .blend = &blendState,
+      .writeMask = wgpu::ColorWriteMask::All,
+  }};
+  const wgpu::FragmentState fragmentState{
+      .module = module,
+      .entryPoint = "fs_main",
+      .targetCount = colorTargets.size(),
+      .targets = colorTargets.data(),
+  };
+
+  const std::array bindGroupLayoutEntries{
+      wgpu::BindGroupLayoutEntry{
+          .binding = 0,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .sampler = wgpu::SamplerBindingLayout{.type = wgpu::SamplerBindingType::Filtering},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture =
+              wgpu::TextureBindingLayout{
+                  .sampleType = wgpu::TextureSampleType::Float,
+                  .viewDimension = wgpu::TextureViewDimension::e2D,
+              },
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 2,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .buffer =
+              wgpu::BufferBindingLayout{
+                  .type = wgpu::BufferBindingType::Uniform,
+                  .minBindingSize = kStereoUboSize,
+              },
+      },
+  };
+  const wgpu::BindGroupLayoutDescriptor bindGroupLayoutDescriptor{
+      .entryCount = bindGroupLayoutEntries.size(),
+      .entries = bindGroupLayoutEntries.data(),
+  };
+  g_UIOverlayBindGroupLayout = g_device.CreateBindGroupLayout(&bindGroupLayoutDescriptor);
+  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
+      .bindGroupLayoutCount = 1,
+      .bindGroupLayouts = &g_UIOverlayBindGroupLayout,
+  };
+  auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
+  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
+      .layout = pipelineLayout,
+      .vertex =
+          wgpu::VertexState{
+              .module = module,
+              .entryPoint = "vs_main",
+          },
+      .primitive =
+          wgpu::PrimitiveState{
+              .topology = wgpu::PrimitiveTopology::TriangleList,
+          },
+      .multisample =
+          wgpu::MultisampleState{
+              .count = 1,
+              .mask = UINT32_MAX,
+          },
+      .fragment = &fragmentState,
+  };
+  g_UIOverlayPipeline = g_device.CreateRenderPipeline(&pipelineDescriptor);
 }
 
 void create_resample_pipeline() {
@@ -652,14 +987,51 @@ void create_resample_pipeline() {
 }
 
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source) {
+  return create_copy_bind_group_stereo(source, source);
+}
+
+wgpu::BindGroup create_ui_overlay_bind_group(const TextureWithSampler& uiTexture) {
   const std::array bindGroupEntries{
       wgpu::BindGroupEntry{
           .binding = 0,
-          .sampler = source.sampler,
+          .sampler = uiTexture.sampler,
       },
       wgpu::BindGroupEntry{
           .binding = 1,
-          .textureView = source.view,
+          .textureView = uiTexture.view,
+      },
+      wgpu::BindGroupEntry{
+          .binding = 2,
+          .buffer = g_StereoUbo,
+          .size = kStereoUboSize,
+      },
+  };
+  const wgpu::BindGroupDescriptor bindGroupDescriptor{
+      .layout = g_UIOverlayBindGroupLayout,
+      .entryCount = bindGroupEntries.size(),
+      .entries = bindGroupEntries.data(),
+  };
+  return g_device.CreateBindGroup(&bindGroupDescriptor);
+}
+
+wgpu::BindGroup create_copy_bind_group_stereo(const TextureWithSampler& left, const TextureWithSampler& right) {
+  const std::array bindGroupEntries{
+      wgpu::BindGroupEntry{
+          .binding = 0,
+          .sampler = left.sampler,
+      },
+      wgpu::BindGroupEntry{
+          .binding = 1,
+          .textureView = left.view,
+      },
+      wgpu::BindGroupEntry{
+          .binding = 2,
+          .textureView = right.view,
+      },
+      wgpu::BindGroupEntry{
+          .binding = 3,
+          .buffer = g_StereoUbo,
+          .size = kStereoUboSize,
       },
   };
   const wgpu::BindGroupDescriptor bindGroupDescriptor{
@@ -670,13 +1042,15 @@ wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source) {
   return g_device.CreateBindGroup(&bindGroupDescriptor);
 }
 
-const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& encoder, const Viewport& viewport) {
-  const auto& source = present_source();
+const TextureWithSampler& resample_present_source_for(const wgpu::CommandEncoder& encoder, const Viewport& viewport,
+                                                      AuroraEye eye) {
+  const auto& source = present_source_for(eye);
+  TextureWithSampler& target = (eye == AURORA_EYE_RIGHT) ? g_resampledFrameBufferRight : g_resampledFrameBuffer;
   const uint32_t width = viewport_extent(viewport.width);
   const uint32_t height = viewport_extent(viewport.height);
-  if (!g_resampledFrameBuffer.view || g_resampledFrameBuffer.size.width != width ||
-      g_resampledFrameBuffer.size.height != height || g_resampledFrameBuffer.format != source.format) {
-    g_resampledFrameBuffer = create_render_texture(width, height, false);
+  if (!target.view || target.size.width != width || target.size.height != height ||
+      target.format != source.format) {
+    target = create_render_texture(width, height, false);
   }
 
   const ResampleUniformBlock uniform{
@@ -711,7 +1085,7 @@ const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& en
 
   const std::array attachments{
       wgpu::RenderPassColorAttachment{
-          .view = g_resampledFrameBuffer.view,
+          .view = target.view,
           .loadOp = wgpu::LoadOp::Clear,
           .storeOp = wgpu::StoreOp::Store,
       },
@@ -729,7 +1103,11 @@ const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& en
   pass.Draw(3);
   pass.End();
 
-  return g_resampledFrameBuffer;
+  return target;
+}
+
+const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& encoder, const Viewport& viewport) {
+  return resample_present_source_for(encoder, viewport, AURORA_EYE_LEFT);
 }
 
 static wgpu::BackendType to_wgpu_backend(AuroraBackend backend) {
@@ -782,6 +1160,10 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         .requiredFeatures = requiredInstanceFeatures.data(),
     };
 #ifdef WEBGPU_DAWN
+    // allow_unsafe_apis is also what makes SharedTextureMemoryD3D12Resource
+    // visible: shared-memory features are experimental in Dawn and only
+    // enumerated when the instance carries this toggle, and the LeiaSR weaver
+    // hand-off needs one. Dropping it would silently disable LeiaSR output.
     constexpr std::array instanceToggles{
         "allow_unsafe_apis",
     };
@@ -927,6 +1309,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     g_dualSourceBlendingSupported = false;
     wgpu::SupportedFeatures supportedFeatures;
     g_adapter.GetFeatures(&supportedFeatures);
+#ifdef AURORA_ENABLE_LEIASR
+    bool sharedD3D12Found = false;
+#endif
     for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
       const auto feature = supportedFeatures.features[i];
       if (feature == wgpu::FeatureName::CoreFeaturesAndLimits || feature == wgpu::FeatureName::TextureCompressionBC ||
@@ -950,7 +1335,17 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         requiredFeatures.push_back(feature);
       }
 #endif
+#ifdef AURORA_ENABLE_LEIASR
+      // LeiaSR needs D3D12 resource sharing to bridge Dawn textures and the SR weaver.
+      if (feature == wgpu::FeatureName::SharedTextureMemoryD3D12Resource) {
+        requiredFeatures.push_back(feature);
+        sharedD3D12Found = true;
+      }
+#endif
     }
+#ifdef AURORA_ENABLE_LEIASR
+    Log.info("Adapter advertises SharedTextureMemoryD3D12Resource: {}", sharedD3D12Found);
+#endif
     std::string featureList;
     for (auto featureName : requiredFeatures) {
       featureList += "\n  ";
@@ -1077,6 +1472,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   };
   create_copy_pipeline();
   create_resample_pipeline();
+  create_ui_overlay_pipeline();
   gpu_prof::initialize();
   resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
   g_initialized = true;
@@ -1095,11 +1491,19 @@ void shutdown() {
   g_ResamplePipeline = {};
   g_ResampleUniformBuffer = {};
   g_resampledFrameBuffer = {};
+  g_resampledFrameBufferRight = {};
+  g_UIOverlayBindGroupLayout = {};
+  g_UIOverlayPipeline = {};
+  g_StereoUbo = {};
   g_frameBuffer = {};
   g_frameBufferResolved = {};
   g_depthBuffer = {};
   g_normalBuffer = {};
+  g_normalBufferRight = {};
   g_graphicsConfig.normalBuffer = false;
+  g_frameBufferRight = {};
+  g_frameBufferResolvedRight = {};
+  g_depthBufferRight = {};
   g_queue = {};
   g_surface = {};
   g_device = {};
@@ -1144,8 +1548,13 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   g_depthBuffer = create_depth_texture(width, height);
   if (g_graphicsConfig.normalBuffer) {
     g_normalBuffer = create_normal_texture(width, height);
+    g_normalBufferRight = create_normal_texture(width, height);
   }
-  g_CopyBindGroup = create_copy_bind_group(present_source());
+  g_frameBufferRight = create_render_texture(width, height, true);
+  g_frameBufferResolvedRight = create_render_texture(width, height, false);
+  g_depthBufferRight = create_depth_texture(width, height);
+  g_CopyBindGroup = create_copy_bind_group_stereo(present_source_for(AURORA_EYE_LEFT),
+                                                  present_source_for(AURORA_EYE_RIGHT));
 }
 
 bool refresh_surface(bool recreate) {

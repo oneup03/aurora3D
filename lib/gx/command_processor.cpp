@@ -148,10 +148,31 @@ FogRangeLutKey fog_range_lut_key() noexcept {
   const auto& state = g_gxState.fog;
   const f32 logicalWidth = std::max(g_gxState.logicalViewport.width, 1.f);
   const f32 renderWidth = std::max(g_gxState.renderViewport.width, 1.f);
+
+  // The fog range curve is centred on the PROJECTION AXIS: it models how much
+  // longer the true eye-to-pixel distance is than the Z depth, which is zero at
+  // the axis and grows with angular distance from it. The shader evaluates it
+  // per fragment by screen X (`abuf[fog_range_base + u32(in.pos.x)]`), so the
+  // centre has to sit where the axis actually lands on screen.
+  //
+  // A stereo eye shear lives in proj.m0[2] and slides the whole image by
+  // -m0[2] in NDC. Leave the centre behind and each eye evaluates the curve at
+  // a different offset for the same world point -- denser fog toward one edge,
+  // thinner toward the other, mirrored between the eyes. That reads as a smooth
+  // horizontal brightness ramp present in one eye and not the other, worst at
+  // the screen edge where the curve is steepest, which is exactly the
+  // Ordon/Faron bridge symptom.
+  //
+  // Moving the centre with the image restores an identical offset per world
+  // point in both eyes. This is the physically correct centre rather than a
+  // stereo special case: an off-axis frustum's fog range centre IS its axis.
+  // Zero for a symmetric projection, so mono rendering is bit-identical.
+  const f32 axisShift = g_gxState.projType == GX_PERSPECTIVE ? -g_gxState.proj.m0[2] : 0.f;
+
   return {
       .rangeK = state.rangeK,
       .rangeCenter = ((static_cast<f32>(state.rangeCenter) - g_gxState.logicalViewport.left) / logicalWidth) * 2.f -
-                     1.f + (g_gxState.renderViewport.left / renderWidth) * 2.f,
+                     1.f + (g_gxState.renderViewport.left / renderWidth) * 2.f + axisShift,
       .renderWidth = renderWidth,
       .targetWidth = gfx::get_render_target_size().x,
   };
