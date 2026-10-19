@@ -1852,10 +1852,15 @@ TEST_F(GXFifoTest, DestroyCopyTex_RemovesActiveCopyTextureAndCacheEntriesForPoin
   alignas(32) u8 imageB[32]{};
 
   const aurora::gx::GXState::CopyTextureRef ref{.revision = 1};
-  gxState().copyTextures[imageA] = ref;
-  gxState().copyTextures[imageB] = ref;
+  for (auto& copies : gxState().copyTextures) {
+    copies[imageA] = ref;
+    copies[imageB] = ref;
+  }
   gxState().copyTextureCache.emplace(
       aurora::gx::GXState::CopyTextureKey{.dest = imageA, .width = 32, .height = 32, .format = GX_TF_I4}, ref);
+  gxState().copyTextureCache.emplace(
+      aurora::gx::GXState::CopyTextureKey{.dest = imageA, .width = 32, .height = 32, .format = GX_TF_I4, .eye = 1},
+      ref);
   gxState().copyTextureCache.emplace(
       aurora::gx::GXState::CopyTextureKey{.dest = imageA, .width = 64, .height = 64, .format = GX_TF_I8}, ref);
   gxState().copyTextureCache.emplace(
@@ -1866,8 +1871,10 @@ TEST_F(GXFifoTest, DestroyCopyTex_RemovesActiveCopyTextureAndCacheEntriesForPoin
 
   decode_fifo(bytes);
 
-  EXPECT_FALSE(gxState().copyTextures.contains(imageA));
-  EXPECT_TRUE(gxState().copyTextures.contains(imageB));
+  for (const auto& copies : gxState().copyTextures) {
+    EXPECT_FALSE(copies.contains(imageA));
+    EXPECT_TRUE(copies.contains(imageB));
+  }
   for (const auto& [key, _] : gxState().copyTextureCache) {
     EXPECT_NE(key.dest, imageA);
   }

@@ -101,7 +101,9 @@ void evict_tlut_object(u32 tlutObjId) noexcept {
   }
 }
 void evict_copy_texture(const void* dest) noexcept {
-  g_gxState.copyTextures.erase(dest);
+  for (auto& copies : g_gxState.copyTextures) {
+    copies.erase(dest);
+  }
   for (auto it = g_gxState.copyTextureCache.begin(); it != g_gxState.copyTextureCache.end();) {
     if (it->first.dest == dest) {
       g_gxState.copyTextureCache.erase(it++);

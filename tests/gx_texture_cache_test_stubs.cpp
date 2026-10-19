@@ -34,6 +34,10 @@ auto fmt::formatter<AuroraLogLevel>::format(AuroraLogLevel level, format_context
   return fmt::format_to(ctx.out(), "{}", static_cast<int>(level));
 }
 
+namespace aurora::webgpu {
+AuroraEye g_activeEye = AURORA_EYE_LEFT;
+} // namespace aurora::webgpu
+
 namespace aurora::gx {
 GXState g_gxState{};
 

@@ -1,4 +1,5 @@
 #include "gx/texture.hpp"
+#include "webgpu/gpu.hpp"
 
 #include <aurora/texture.hpp>
 #include <gtest/gtest.h>
@@ -259,13 +260,13 @@ TEST_F(GxTextureCacheTest, CopyRevisionRequeuesDynamicPaletteConversion) {
   g_gxState.loadedTextures[0] = make_texture(palette.data(), 1, GX_TF_C8, 4, 4);
   g_gxState.loadedTextures[0].tlut = GX_TLUT0;
   g_gxState.loadedTluts[0] = make_tlut(palette.data(), 1, 256);
-  g_gxState.copyTextures[palette.data()] = {.handle = copy, .revision = 1};
+  g_gxState.copyTextures[AURORA_EYE_LEFT][palette.data()] = {.handle = copy, .revision = 1};
   ShaderInfo info{};
   info.sampledTextures.set(0);
   resolve_sampled_textures(info);
   EXPECT_EQ(testing::palette_conversions(), 1);
 
-  ++g_gxState.copyTextures[palette.data()].revision;
+  ++g_gxState.copyTextures[AURORA_EYE_LEFT][palette.data()].revision;
   texture::invalidate_bindings();
   resolve_sampled_textures(info);
 
@@ -277,17 +278,46 @@ TEST_F(GxTextureCacheTest, CopyRecreationAtSameDestinationRebindsHandle) {
   const auto first = testing::make_texture_handle(2, 2);
   const auto second = testing::make_texture_handle(2, 2);
   g_gxState.loadedTextures[0] = make_texture(destination.data(), 1);
-  g_gxState.copyTextures[destination.data()] = {.handle = first, .revision = 1};
+  g_gxState.copyTextures[AURORA_EYE_LEFT][destination.data()] = {.handle = first, .revision = 1};
   ShaderInfo info{};
   info.sampledTextures.set(0);
   resolve_sampled_textures(info);
   EXPECT_EQ(g_gxState.textures[0].ref, first);
 
-  g_gxState.copyTextures[destination.data()] = {.handle = second, .revision = 1};
+  g_gxState.copyTextures[AURORA_EYE_LEFT][destination.data()] = {.handle = second, .revision = 1};
   texture::invalidate_bindings();
   resolve_sampled_textures(info);
 
   EXPECT_EQ(g_gxState.textures[0].ref, second);
+}
+
+TEST_F(GxTextureCacheTest, StereoCopiesResolvePerEyeWithFallback) {
+  std::array<uint8_t, 16> destination{};
+  std::array<uint8_t, 16> leftOnly{};
+  const auto left = testing::make_texture_handle(2, 2);
+  const auto right = testing::make_texture_handle(2, 2);
+  const auto shared = testing::make_texture_handle(2, 2);
+  g_gxState.loadedTextures[0] = make_texture(destination.data(), 1);
+  g_gxState.loadedTextures[1] = make_texture(leftOnly.data(), 2);
+  g_gxState.copyTextures[AURORA_EYE_LEFT][destination.data()] = {.handle = left, .revision = 1};
+  g_gxState.copyTextures[AURORA_EYE_RIGHT][destination.data()] = {.handle = right, .revision = 1};
+  g_gxState.copyTextures[AURORA_EYE_LEFT][leftOnly.data()] = {.handle = shared, .revision = 1};
+  ShaderInfo info{};
+  info.sampledTextures.set(0);
+  info.sampledTextures.set(1);
+
+  webgpu::g_activeEye = AURORA_EYE_LEFT;
+  resolve_sampled_textures(info);
+  EXPECT_EQ(g_gxState.textures[0].ref, left);
+  EXPECT_EQ(g_gxState.textures[1].ref, shared);
+
+  webgpu::g_activeEye = AURORA_EYE_RIGHT;
+  texture::invalidate_bindings();
+  resolve_sampled_textures(info);
+  EXPECT_EQ(g_gxState.textures[0].ref, right);
+  EXPECT_EQ(g_gxState.textures[1].ref, shared);
+
+  webgpu::g_activeEye = AURORA_EYE_LEFT;
 }
 
 TEST_F(GxTextureCacheTest, ObjectAgingKeepsContentEntry) {

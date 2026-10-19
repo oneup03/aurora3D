@@ -4,6 +4,7 @@
 #include "../gfx/tex_palette_conv.hpp"
 #include "../gfx/texture_convert.hpp"
 #include "../gfx/texture_replacement.hpp"
+#include "../webgpu/gpu.hpp"
 #include "shader_info.hpp"
 
 #include <absl/container/flat_hash_map.h>
@@ -451,14 +452,14 @@ void touch_bound_texture(const GXTexObj_& obj) {
   if (!is_palette_format(obj.format()) || obj.tlut >= g_gxState.loadedTluts.size()) {
     return;
   }
-  const auto copyIt = g_gxState.copyTextures.find(obj.data);
-  if (copyIt == g_gxState.copyTextures.end()) {
+  const auto* copyRef = find_copy_texture(obj.data);
+  if (copyRef == nullptr) {
     return;
   }
   const auto& tlut = g_gxState.loadedTluts[obj.tlut];
   if (auto tlutIt = s_tlutObjectCaches.find(tlut.tlutObjId); tlutIt != s_tlutObjectCaches.end()) {
     tlutIt->second.lastUsedFrame = s_frameCount;
-    if (auto dynamicIt = tlutIt->second.dynamicPaletteTextures.find(make_dynamic_palette_key(obj, copyIt->second));
+    if (auto dynamicIt = tlutIt->second.dynamicPaletteTextures.find(make_dynamic_palette_key(obj, *copyRef));
         dynamicIt != tlutIt->second.dynamicPaletteTextures.end()) {
       dynamicIt->second.lastUsedFrame = s_frameCount;
     }
@@ -790,7 +791,9 @@ void evict_tlut_object(u32 tlutObjId) noexcept {
 }
 
 void clear_copy_texture_cache() noexcept {
-  g_gxState.copyTextures.clear();
+  for (auto& copies : g_gxState.copyTextures) {
+    copies.clear();
+  }
   g_gxState.copyTextureCache.clear();
   for (auto& [_, cache] : s_tlutObjectCaches) {
     cache.dynamicPaletteTextures.clear();
@@ -802,11 +805,13 @@ void clear_static_texture_cache() noexcept { s_pendingCacheClears.fetch_add(1, s
 
 void evict_copy_texture(const void* dest) noexcept {
   absl::flat_hash_set<const void*> sourceIdentities;
-  if (const auto it = g_gxState.copyTextures.find(dest); it != g_gxState.copyTextures.end()) {
-    if (it->second.handle) {
-      sourceIdentities.insert(it->second.handle.get());
+  for (auto& copies : g_gxState.copyTextures) {
+    if (const auto it = copies.find(dest); it != copies.end()) {
+      if (it->second.handle) {
+        sourceIdentities.insert(it->second.handle.get());
+      }
+      copies.erase(it);
     }
-    g_gxState.copyTextures.erase(it);
   }
 
   for (auto it = g_gxState.copyTextureCache.begin(); it != g_gxState.copyTextureCache.end();) {
@@ -834,6 +839,17 @@ void evict_copy_texture(const void* dest) noexcept {
   texture::invalidate_bindings();
 }
 
+const GXState::CopyTextureRef* find_copy_texture(const void* dest) noexcept {
+  const size_t own = webgpu::g_activeEye == AURORA_EYE_RIGHT ? 1 : 0;
+  for (const size_t eye : {own, own ^ 1}) {
+    const auto& copies = g_gxState.copyTextures[eye];
+    if (const auto it = copies.find(dest); it != copies.end()) {
+      return &it->second;
+    }
+  }
+  return nullptr;
+}
+
 void resolve_sampled_textures(const ShaderInfo& info) noexcept {
   ZoneScoped;
   apply_pending_invalidations();
@@ -852,8 +868,7 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     }
 
     gfx::TextureHandle handle;
-    const auto copyIt = g_gxState.copyTextures.find(obj.data);
-    const GXState::CopyTextureRef* copyRef = copyIt != g_gxState.copyTextures.end() ? &copyIt->second : nullptr;
+    const GXState::CopyTextureRef* copyRef = find_copy_texture(obj.data);
     if (is_palette_format(obj.format())) {
       const auto tlutIdx = static_cast<size_t>(obj.tlut);
       if (tlutIdx < g_gxState.loadedTluts.size()) {

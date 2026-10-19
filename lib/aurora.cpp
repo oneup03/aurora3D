@@ -257,6 +257,11 @@ bool begin_frame() noexcept {
 
   // Always start each frame on the left eye so set_efb_targets picks the left
   // EFB for pass 0. Stereo painters call aurora_set_active_eye later to swap.
+  if (webgpu::g_activeEye != AURORA_EYE_LEFT) {
+    // EFB copies are per eye (see GXState::copyTextures), so texture bindings
+    // resolved during the right eye's pass point at the right eye's copies.
+    gx::texture::invalidate_bindings();
+  }
   webgpu::g_activeEye = AURORA_EYE_LEFT;
 
   imgui::new_frame(window::get_window_size());
@@ -711,6 +716,11 @@ void aurora_set_active_eye(AuroraEye eye) {
   aurora::gx::fifo::drain();
   aurora::webgpu::g_activeEye = eye;
   aurora::gfx::begin_new_efb_pass_for_active_eye();
+  // EFB copies are per eye (see GXState::copyTextures). Cached bindings still
+  // hold the previous eye's copy handles, and a texture object sampled before
+  // this eye re-captures it -- motion blur reading last frame's capture --
+  // would otherwise hit that cache and blend in the other eye's image.
+  aurora::gx::texture::invalidate_bindings();
 #else
   (void)eye;
 #endif

@@ -37,12 +37,14 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
   const auto rect = map_logical_scissor(g_gxState.texCopySrc);
   const auto [dstWidth, dstHeight] = scale_copy_dst(g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight);
   const auto texCopyFmt = g_gxState.texCopyFmt;
+  const auto eye = static_cast<u8>(webgpu::g_activeEye);
 
   const GXState::CopyTextureKey key{
       .dest = dest,
       .width = dstWidth,
       .height = dstHeight,
       .format = texCopyFmt,
+      .eye = eye,
   };
   auto it = g_gxState.copyTextureCache.find(key);
   if (it == g_gxState.copyTextureCache.end()) {
@@ -62,7 +64,7 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
   gfx::resolve_pass_into(handle.handle, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
                          clear_depth_value(), texCopyFmt, g_gxState.pixelFmt);
   ++handle.revision;
-  g_gxState.copyTextures[dest] = handle;
+  g_gxState.copyTextures[eye][dest] = handle;
   texture::invalidate_bindings();
 }
 } // namespace aurora::gx
