@@ -82,7 +82,9 @@ struct StereoUboData {
   float hudDepth = 0.f;
   float ghostContrast = 1.f;
   float ghostBlackFloor = 0.f;
-  float _pad0 = 0.f;
+  // 1 = run ghost_reduce in linear light (pow 2.2 around it). Set only for the
+  // LeiaSR SbS pass, whose weaver cancels crosstalk in linear light.
+  uint32_t ghostLinear = 0;
   float _pad1 = 0.f;
 };
 static_assert(sizeof(StereoUboData) == kStereoUboSize, "StereoUboData must match the WGSL StereoUbo layout");

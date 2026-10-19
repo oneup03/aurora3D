@@ -32,6 +32,7 @@
 #include <SDL3/SDL_system.h>
 #include <SDL3/SDL_video.h>
 
+#include <atomic>
 #include <cstdint>
 #include <exception>
 
@@ -94,6 +95,68 @@ bool g_wovenInDawnAccess = false;
 // release_d3d_resources() so a fresh allocation re-pushes.
 ID3D12Resource* g_lastWeaverInputResource = nullptr;
 DXGI_FORMAT g_lastWeaverOutputFormat = DXGI_FORMAT_UNKNOWN;
+
+// The weaver's own anti-crosstalk settings (AuroraStereoConfig::srCrosstalk*),
+// last pushed through SR-lib's SetCrosstalk. Settings belong to ONE weaver -- a
+// new one starts from the panel's defaults -- so g_crosstalkPushed is cleared
+// whenever g_sr changes, forcing a push on its first weave. SetCrosstalk reads
+// the panel's defaults itself and scales from them, so (DEFAULT, 1, 1) is the
+// display exactly as shipped.
+struct CrosstalkSettings {
+  AuroraSrCrosstalkMode mode;
+  float strength;
+  float contrast;
+
+  bool operator==(const CrosstalkSettings&) const = default;
+};
+CrosstalkSettings g_lastCrosstalk{};
+bool g_crosstalkPushed = false;
+// Read by the UI thread (aurora_leiasr_crosstalk_available), hence atomic.
+std::atomic_bool g_crosstalkAvailable = false;
+
+SimulatedReality::SRCrosstalkMode to_sr_crosstalk_mode(AuroraSrCrosstalkMode mode) noexcept {
+  switch (mode) {
+  case AURORA_SR_CROSSTALK_OFF:
+    return SimulatedReality::SRCrosstalkMode::Off;
+  case AURORA_SR_CROSSTALK_STATIC:
+    return SimulatedReality::SRCrosstalkMode::Static;
+  case AURORA_SR_CROSSTALK_DYNAMIC:
+    return SimulatedReality::SRCrosstalkMode::Dynamic;
+  case AURORA_SR_CROSSTALK_DEFAULT:
+  default:
+    return SimulatedReality::SRCrosstalkMode::Default;
+  }
+}
+
+// Render thread, just before Weave(). Pushes only when a value changed or the
+// weaver is new; logs every push, since that line is the only evidence the
+// runtime accepted it. A runtime without IWeaverSettings1 reports false once and
+// is not asked again until a value changes -- the UI hides the controls then.
+void apply_crosstalk() {
+  const CrosstalkSettings wanted{
+      .mode = g_stereoCfg.srCrosstalkMode,
+      .strength = g_stereoCfg.srCrosstalkStrength,
+      .contrast = g_stereoCfg.srWeaveContrast,
+  };
+  if (g_crosstalkPushed && wanted == g_lastCrosstalk) {
+    return;
+  }
+  bool ok = false;
+  try {
+    ok = g_sr->SetCrosstalk(to_sr_crosstalk_mode(wanted.mode), wanted.strength, wanted.contrast);
+  } catch (...) {
+    ok = false;
+  }
+  if (ok) {
+    Log.warn("LeiaSR: anti-crosstalk applied (mode {}, strength {:.2f}x, weave contrast {:.2f}x)",
+             static_cast<int>(wanted.mode), wanted.strength, wanted.contrast);
+  } else if (!g_crosstalkPushed || g_crosstalkAvailable) {
+    Log.warn("LeiaSR: weaver anti-crosstalk controls not offered by this SR runtime");
+  }
+  g_lastCrosstalk = wanted;
+  g_crosstalkPushed = true;
+  g_crosstalkAvailable = ok;
+}
 
 DXGI_FORMAT to_dxgi_format(wgpu::TextureFormat fmt) noexcept {
   switch (fmt) {
@@ -262,12 +325,20 @@ bool try_init() {
     return false;
   }
 
-  // Avoid double-gamma: our SBS intermediate and the swap chain hold linear
-  // UNORM values, so don't ask the weaver shader to convert either way. This is
-  // weaver state rather than context state, so it doesn't matter that it now
+  // Linearize on read, re-encode on write. The SbS intermediate and the swap
+  // chain are non-sRGB UNORM (best_surface_format forces that), but what they
+  // hold is display-ENCODED: the game writes gamma-space values straight
+  // through. The weaver's crosstalk cancellation subtracts a calibrated
+  // fraction of the opposite view, and that calibration is in linear light --
+  // fed encoded values as if they were linear, it under-cancels exactly in the
+  // dark tones where ghosts show (a 0.20 pixel moves to 0.19 instead of 0.15)
+  // and the anti-crosstalk Strength control barely moves anything. VRto3D and
+  // UEVR-3D both weave with (true, true). The compose shader's ghost_reduce
+  // must agree, so the LeiaSR SbS pass runs it in linear (StereoUbo::ghostLinear).
+  // This is weaver state rather than context state, so it doesn't matter that it
   // lands after SRContext::initialize() (which happened inside the create).
   try {
-    sr->SetShaderSRGBConversion(false, false);
+    sr->SetShaderSRGBConversion(true, true);
   } catch (...) {
     // Non-fatal -- fall back to whatever default the SDK picks.
   }
@@ -310,6 +381,7 @@ bool try_init() {
 
   // Commit all the successfully-created state.
   g_sr = sr;
+  g_crosstalkPushed = false;
   g_d3dDevice = std::move(d3dDevice);
   g_d3dQueue = std::move(d3dQueue);
   g_hwnd = hwnd;
@@ -460,6 +532,10 @@ bool is_runtime_installed() {
   return sr_runtime_dlls_available();
 }
 
+bool crosstalk_available() {
+  return g_crosstalkAvailable;
+}
+
 bool ensure_ready(uint32_t width, uint32_t height, wgpu::TextureFormat format) {
   if (!is_supported()) {
     return false;
@@ -578,6 +654,7 @@ void weave() {
       g_sr->SetOutputFormat(g_dxgiFormat);
       g_lastWeaverOutputFormat = g_dxgiFormat;
     }
+    apply_crosstalk();
     // Sets the command list + viewport + scissor and records the weave into it.
     g_sr->Weave(g_d3dCommandList.Get(), viewport, scissor);
   } catch (const std::exception& e) {
@@ -610,6 +687,7 @@ void weave() {
       g_wovenInDawnAccess = true;
     }
     g_state = State::Disabled;
+    g_crosstalkAvailable = false;
     Log.warn("LeiaSR disabled for remainder of session due to weave failure; full teardown deferred to shutdown");
     return;
   }
@@ -646,6 +724,8 @@ void shutdown() {
     g_sr->Delete();
     g_sr = nullptr;
   }
+  g_crosstalkPushed = false;
+  g_crosstalkAvailable = false;
   g_wovenRtv = {};
   g_rtvHeap.Reset();
   g_d3dCommandList.Reset();

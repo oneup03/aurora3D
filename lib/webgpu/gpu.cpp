@@ -61,6 +61,9 @@ AuroraStereoConfig g_stereoCfg{
     .refractionAmplitudeScale = 1.0f,
     .ghostContrast = 1.0f,
     .ghostBlackFloor = 0.0f,
+    .srCrosstalkMode = AURORA_SR_CROSSTALK_DEFAULT,
+    .srCrosstalkStrength = 1.0f,
+    .srWeaveContrast = 1.0f,
 };
 AuroraEye g_activeEye = AURORA_EYE_LEFT;
 
@@ -520,7 +523,7 @@ struct StereoUbo {
     hudDepth: f32,
     ghostContrast: f32,
     ghostBlackFloor: f32,
-    _pad0: f32,
+    ghostLinear: u32,
     _pad1: f32,
 };
 
@@ -560,15 +563,15 @@ fn vs_main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
 // Ghost / crosstalk range compression. Runs LAST, on the composed pixel, so
 // what gets compressed is exactly what reaches the panel.
 //
-// SPACE: this operates on the values as encoded, with no linearize/re-encode
-// pair around it, and that is deliberate -- the swap-chain format is forced
-// to a non-sRGB UNORM (see best_surface_format/to_linear), so the EFB content
-// this shader samples is already display-encoded, and the LeiaSR weaver is
-// initialized with SetShaderSRGBConversion(false, false) (leiasr.cpp), i.e.
-// its own crosstalk cancellation reads and writes those same encoded values.
-// The correction has to live in whatever space the display's cancellation
-// lives in; if either of those two facts changes, wrap this in
-// pow(c, 2.2) / pow(c, 1/2.2) so the two stay consistent.
+// SPACE: the correction has to live in whatever space the display's own
+// cancellation lives in. The EFB content this shader samples is display-
+// encoded (the swap-chain format is forced to a non-sRGB UNORM, see
+// best_surface_format/to_linear), and by default this works on those values
+// as encoded. The LeiaSR weaver is the exception: it is initialized with
+// SetShaderSRGBConversion(true, true) (leiasr.cpp) and cancels in linear
+// light, so its SbS pass sets ghostLinear and this wraps the squeeze in a
+// plain pow(2.2) -- deliberately not the piecewise sRGB curve, which would be
+// more "correct" than the weaver's own conversion and desynchronize the two.
 //
 // contrast == 1.0 and blackFloor == 0.0 are exact no-ops and are branched
 // out, so the untouched path stays bit-exact and free.
@@ -577,6 +580,10 @@ fn ghost_reduce(c: vec3<f32>) -> vec3<f32> {
         return c;
     }
     var v = saturate(c);
+    let inLinear = stereo.ghostLinear != 0u;
+    if (inLinear) {
+        v = pow(v, vec3<f32>(2.2));
+    }
     // Squeeze toward mid-grey: shrinks |L - R| and leaves headroom at both
     // ends of the range.
     v = (v - vec3<f32>(0.5)) * stereo.ghostContrast + vec3<f32>(0.5);
@@ -584,7 +591,11 @@ fn ghost_reduce(c: vec3<f32>) -> vec3<f32> {
     // display's subtraction, which would otherwise clip at 0 and leave the
     // clipped part visible as a ghost.
     v = v * (1.0 - stereo.ghostBlackFloor) + vec3<f32>(stereo.ghostBlackFloor);
-    return saturate(v);
+    v = saturate(v);
+    if (inLinear) {
+        v = pow(v, vec3<f32>(1.0 / 2.2));
+    }
+    return v;
 }
 
 @fragment
@@ -794,7 +805,7 @@ struct StereoUbo {
     hudDepth: f32,
     ghostContrast: f32,
     ghostBlackFloor: f32,
-    _pad0: f32,
+    ghostLinear: u32,
     _pad1: f32,
 };
 

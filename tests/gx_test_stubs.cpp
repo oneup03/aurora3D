@@ -64,6 +64,9 @@ AuroraStereoConfig g_stereoCfg{
     .refractionAmplitudeScale = 1.f,
     .ghostContrast = 1.f,
     .ghostBlackFloor = 0.f,
+    .srCrosstalkMode = AURORA_SR_CROSSTALK_DEFAULT,
+    .srCrosstalkStrength = 1.f,
+    .srWeaveContrast = 1.f,
 };
 AuroraEye g_activeEye = AURORA_EYE_LEFT;
 } // namespace aurora::webgpu

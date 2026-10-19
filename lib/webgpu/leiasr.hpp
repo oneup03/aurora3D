@@ -76,6 +76,11 @@ const TextureWithSampler& output_texture();
 // wrote input_view() and the Dawn submit that samples output_texture().
 void weave();
 
+// True once the live weaver has accepted g_stereoCfg's srCrosstalk* settings
+// (the runtime exposes IWeaverSettings1). Thread-safe: written by weave() on the
+// render worker, read by the UI thread to decide whether to offer the controls.
+bool crosstalk_available();
+
 // Drop the weaver, SR resources, and shared textures. Called on swapchain
 // resize (before recreating) and on shutdown.
 void shutdown();

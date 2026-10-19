@@ -398,7 +398,8 @@ void end_frame() noexcept {
           // the SbS intermediate, BEFORE the weave: residual ghosting on an SR
           // panel is the weaver's own crosstalk cancellation clipping at 0/1,
           // so the range has to be compressed on the pixels the weaver is
-          // about to read.
+          // about to read. In linear light, because that is where the weaver
+          // cancels (leiasr.cpp's SetShaderSRGBConversion).
           const webgpu::StereoUboData sbsUbo{
               .mode = 0u,
               .w = viewport.width,
@@ -406,6 +407,7 @@ void end_frame() noexcept {
               .hudDepth = 0.0f,
               .ghostContrast = webgpu::g_stereoCfg.ghostContrast,
               .ghostBlackFloor = webgpu::g_stereoCfg.ghostBlackFloor,
+              .ghostLinear = 1u,
           };
           g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &sbsUbo, sizeof(sbsUbo));
 
@@ -759,4 +761,12 @@ bool aurora_stereo_mode_supported(AuroraStereoMode mode) {
   default:
     return false;
   }
+}
+
+bool aurora_leiasr_crosstalk_available(void) {
+#if defined(AURORA_ENABLE_LEIASR) && defined(AURORA_ENABLE_GX)
+  return aurora::webgpu::leiasr::crosstalk_available();
+#else
+  return false;
+#endif
 }

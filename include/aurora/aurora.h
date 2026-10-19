@@ -154,6 +154,16 @@ typedef enum {
   AURORA_STEREO_LEIASR,
 } AuroraStereoMode;
 
+// The LeiaSR weaver's own crosstalk-cancellation mode. Zero is DEFAULT (keep the
+// panel's choice -- Dynamic on current panels) so a zero-initialized config
+// leaves the display as shipped.
+typedef enum {
+  AURORA_SR_CROSSTALK_DEFAULT = 0,
+  AURORA_SR_CROSSTALK_OFF,
+  AURORA_SR_CROSSTALK_STATIC,
+  AURORA_SR_CROSSTALK_DYNAMIC,
+} AuroraSrCrosstalkMode;
+
 typedef struct {
   AuroraStereoMode mode;
   float eyeSeparation;
@@ -198,6 +208,25 @@ typedef struct {
   // zero-initialized ghostContrast would flatten the image to mid-grey.
   float ghostContrast;
   float ghostBlackFloor;
+
+  // The LeiaSR weaver's OWN anti-crosstalk, distinct from the compose-shader
+  // levers above: how hard the panel pre-subtracts the opposite view, and the
+  // weaver's weaving contrast. Used only in AURORA_STEREO_LEIASR, and only when
+  // the installed SR runtime exposes the settings
+  // (aurora_leiasr_crosstalk_available()).
+  //
+  //  srCrosstalkStrength  Multiple of the panel's measured cancellation
+  //                       factors; 1.0 = as shipped. Higher cancels more ghosting
+  //                       but clips more, which ghostBlackFloor gives room for.
+  //  srWeaveContrast      Multiple of the panel's weaving contrast; 1.0 = as
+  //                       shipped. Useful range ~0.5..1.0.
+  //
+  // (DEFAULT, 1.0, 1.0) restores the panel's own settings exactly. Callers using
+  // aggregate init MUST set both floats -- zero strength disables cancellation
+  // and zero contrast flattens the weave.
+  AuroraSrCrosstalkMode srCrosstalkMode;
+  float srCrosstalkStrength;
+  float srWeaveContrast;
 } AuroraStereoConfig;
 
 typedef enum {
@@ -209,6 +238,11 @@ void aurora_set_stereo_config(const AuroraStereoConfig* cfg);
 void aurora_set_active_eye(AuroraEye eye);
 AuroraEye aurora_get_active_eye();
 bool aurora_stereo_mode_supported(AuroraStereoMode mode);
+// True once a live LeiaSR weaver has accepted the srCrosstalk* settings, i.e.
+// the panel is weaving and the SR runtime exposes its anti-crosstalk controls.
+// False before the first weave, on runtimes without the controls, and after the
+// weaver goes away. Thread-safe; meant for gating settings UI.
+bool aurora_leiasr_crosstalk_available(void);
 
 #ifdef __cplusplus
 }
