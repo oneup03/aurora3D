@@ -152,6 +152,9 @@ typedef enum {
   AURORA_STEREO_CHECKERBOARD,
   AURORA_STEREO_ANAGLYPH,
   AURORA_STEREO_LEIASR,
+  // Full SbS on a SteamVR overlay over the game's Steam screen (Steam Frame, Linux);
+  // the window itself gets a blank frame. See lib/webgpu/steam_frame.hpp.
+  AURORA_STEREO_STEAM_FRAME,
 } AuroraStereoMode;
 
 // The LeiaSR weaver's own crosstalk-cancellation mode. Zero is DEFAULT (keep the

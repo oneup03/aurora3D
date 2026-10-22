@@ -24,6 +24,9 @@
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "gpu_prof.hpp"
+#ifdef AURORA_ENABLE_STEAM_FRAME
+#include "steam_frame.hpp"
+#endif
 
 #ifdef WEBGPU_DAWN
 #include "../dawn/TracyPlatform.hpp"
@@ -1397,6 +1400,14 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         sharedD3D12Found = true;
       }
 #endif
+#ifdef AURORA_ENABLE_STEAM_FRAME
+      // Steam Frame renders into Frame-3D-Lib's dma-bufs and hands SteamVR a sync fd
+      // per frame (steam_frame.cpp). Checked with HasFeature there.
+      if (feature == wgpu::FeatureName::SharedTextureMemoryDmaBuf ||
+          feature == wgpu::FeatureName::SharedFenceSyncFD) {
+        requiredFeatures.push_back(feature);
+      }
+#endif
     }
 #ifdef AURORA_ENABLE_LEIASR
     Log.info("Adapter advertises SharedTextureMemoryD3D12Resource: {}", sharedD3D12Found);
@@ -1540,6 +1551,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 void shutdown() {
   g_initialized = false;
   gfx::gpu_synchronize();
+#ifdef AURORA_ENABLE_STEAM_FRAME
+  steam_frame::shutdown();
+#endif
   gpu_prof::shutdown();
   g_CopyBindGroupLayout = {};
   g_CopyPipeline = {};

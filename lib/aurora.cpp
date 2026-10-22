@@ -16,6 +16,9 @@
 #ifdef AURORA_ENABLE_LEIASR
 #  include "webgpu/leiasr.hpp"
 #endif
+#ifdef AURORA_ENABLE_STEAM_FRAME
+#  include "webgpu/steam_frame.hpp"
+#endif
 #include <webgpu/webgpu_cpp.h>
 #endif
 
@@ -322,6 +325,12 @@ void end_frame() noexcept {
     const bool canPresent = currentTexture && currentView;
     if (canPresent) {
       const bool stereo_active = webgpu::g_stereoCfg.mode != AURORA_STEREO_OFF;
+#ifdef AURORA_ENABLE_STEAM_FRAME
+      // Leaving the mode drops the context, which removes the SteamVR overlay.
+      if (webgpu::g_stereoCfg.mode != AURORA_STEREO_STEAM_FRAME) {
+        webgpu::steam_frame::shutdown();
+      }
+#endif
       {
         // Compose parameters for the stereo-aware XFB copy shader. Mode 0
         // (OFF) degenerates to a plain left-eye blit. The ghost-reduction
@@ -341,6 +350,9 @@ void end_frame() noexcept {
       // Set when presentBindGroup holds the LeiaSR weaver's output, which is
       // panel-sized and carries its own letterbox (see the weave path below).
       bool wovenPresent = false;
+      // Set when this frame went to the Steam Frame overlay instead; the window then
+      // gets only a cleared frame (SteamVR covers its Steam screen with the overlay).
+      bool windowBlank = false;
       if (rmlBindGroup && !rmlOverlay) {
         // Mono backdrop-filter path: RmlUi composited the scene into its own
         // target. record_frame forces the overlay path whenever stereo is on.
@@ -495,6 +507,80 @@ void end_frame() noexcept {
           presentBindGroup = webgpu::create_copy_bind_group(leftResampled);
         }
 #endif
+#ifdef AURORA_ENABLE_STEAM_FRAME
+        if (webgpu::g_stereoCfg.mode == AURORA_STEREO_STEAM_FRAME) {
+          // Steam Frame: compose a full SbS image into one of Frame-3D-Lib's images
+          // and hand it to SteamVR. Each half is a full panel-sized eye with the
+          // letterbox placed by hand, the same two mono draws as the LeiaSR input
+          // above, and each half gets the menu UI at screen depth. Submitted early so
+          // the library's fence covers this work alone.
+          const uint32_t panelWidth = webgpu::g_graphicsConfig.surfaceConfiguration.width;
+          const uint32_t panelHeight = webgpu::g_graphicsConfig.surfaceConfiguration.height;
+          wgpu::TextureView frameView;
+          if (webgpu::steam_frame::ensure_ready(panelWidth, panelHeight,
+                                                webgpu::g_graphicsConfig.surfaceConfiguration.format)) {
+            frameView = webgpu::steam_frame::begin_frame();
+          }
+          // Mode 0: case 0 samples efb_texture_left, and create_copy_bind_group binds
+          // one eye to both slots, so each draw is "blit this eye". The UBO was set to
+          // STEAM_FRAME above, which neither shader has a branch for. Ghost reduction
+          // stays as configured.
+          const webgpu::StereoUboData monoUbo{
+              .mode = 0u,
+              .w = viewport.width,
+              .h = viewport.height,
+              .hudDepth = 0.0f,
+              .ghostContrast = webgpu::g_stereoCfg.ghostContrast,
+              .ghostBlackFloor = webgpu::g_stereoCfg.ghostBlackFloor,
+          };
+          g_queue.WriteBuffer(webgpu::g_StereoUbo, 0, &monoUbo, sizeof(monoUbo));
+          if (frameView) {
+            const std::array frameAttachments{
+                wgpu::RenderPassColorAttachment{
+                    .view = frameView,
+                    .loadOp = wgpu::LoadOp::Clear,
+                    .storeOp = wgpu::StoreOp::Store,
+                },
+            };
+            const wgpu::RenderPassDescriptor framePassDesc{
+                .label = "Steam Frame SbS compose pass",
+                .colorAttachmentCount = frameAttachments.size(),
+                .colorAttachments = frameAttachments.data(),
+            };
+            const auto framePass = encoder.BeginRenderPass(&framePassDesc);
+            const auto leftEyeBindGroup = webgpu::create_copy_bind_group(leftResampled);
+            const auto rightEyeBindGroup = webgpu::create_copy_bind_group(rightResampled);
+            for (uint32_t half = 0; half < 2; ++half) {
+              const float halfOrigin = static_cast<float>(half * panelWidth);
+              framePass.SetViewport(halfOrigin + viewport.left, viewport.top, viewport.width, viewport.height, 0.f,
+                                    1.f);
+              framePass.SetPipeline(webgpu::g_CopyPipeline);
+              framePass.SetBindGroup(0, half == 0 ? leftEyeBindGroup : rightEyeBindGroup, 0, nullptr);
+              framePass.Draw(3);
+              if (rmlOverlayBindGroup && rmlOverlay) {
+                framePass.SetPipeline(webgpu::g_UIOverlayPipeline);
+                framePass.SetBindGroup(0, rmlOverlayBindGroup, 0, nullptr);
+                framePass.Draw(3);
+              }
+            }
+            framePass.End();
+
+            const wgpu::CommandBufferDescriptor frameBufferDesc{.label = "Steam Frame buffer"};
+            const auto frameBuffer = encoder.Finish(&frameBufferDesc);
+            g_queue.Submit(1, &frameBuffer);
+            webgpu::steam_frame::end_frame();
+
+            // Fresh encoder for the window's (blank) pass and ImGui.
+            const wgpu::CommandEncoderDescriptor nextEncoderDesc{.label = "Steam Frame post-submit encoder"};
+            encoder = g_device.CreateCommandEncoder(&nextEncoderDesc);
+            windowBlank = true;
+          } else {
+            // Not running yet (no SteamVR, still retrying) or every image is still
+            // in use: show the left eye in the window meanwhile.
+            presentBindGroup = webgpu::create_copy_bind_group(leftResampled);
+          }
+        }
+#endif
       }
       {
         const std::array attachments{
@@ -511,37 +597,41 @@ void end_frame() noexcept {
             .timestampWrites = webgpu::gpu_prof::pass_writes("Present blit"),
         };
         const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
-        // Copy EFB -> XFB (swapchain)
-        pass.SetPipeline(webgpu::g_CopyPipeline);
-        pass.SetBindGroup(0, presentBindGroup, 0, nullptr);
-        const uint32_t surfaceWidth = webgpu::g_graphicsConfig.surfaceConfiguration.width;
-        const uint32_t surfaceHeight = webgpu::g_graphicsConfig.surfaceConfiguration.height;
-        if (wovenPresent) {
-          // 1:1, origin 0. Every column of a woven image belongs to a specific
-          // physical panel column; an offset or a rescale here reassigns them
-          // and the eyes swap. The letterbox is already inside this texture.
-          pass.SetViewport(0.f, 0.f, static_cast<float>(surfaceWidth), static_cast<float>(surfaceHeight), 0.f,
-                           1.f);
-          pass.SetScissorRect(0, 0, surfaceWidth, surfaceHeight);
-        } else {
-          set_present_viewport(pass, viewport, surfaceWidth, surfaceHeight);
-        }
-
-        pass.Draw(3);
-        if (rmlOverlayBindGroup && rmlOverlay) {
+        // With windowBlank the frame went to the Steam Frame overlay, and the clear
+        // is all the window needs.
+        if (!windowBlank) {
+          // Copy EFB -> XFB (swapchain)
+          pass.SetPipeline(webgpu::g_CopyPipeline);
+          pass.SetBindGroup(0, presentBindGroup, 0, nullptr);
+          const uint32_t surfaceWidth = webgpu::g_graphicsConfig.surfaceConfiguration.width;
+          const uint32_t surfaceHeight = webgpu::g_graphicsConfig.surfaceConfiguration.height;
           if (wovenPresent) {
-            // The UI is a flat overlay on the swap chain, not woven content, so
-            // it keeps the aspect-correct placement it has in every other mode.
+            // 1:1, origin 0. Every column of a woven image belongs to a specific
+            // physical panel column; an offset or a rescale here reassigns them
+            // and the eyes swap. The letterbox is already inside this texture.
+            pass.SetViewport(0.f, 0.f, static_cast<float>(surfaceWidth), static_cast<float>(surfaceHeight), 0.f,
+                             1.f);
+            pass.SetScissorRect(0, 0, surfaceWidth, surfaceHeight);
+          } else {
             set_present_viewport(pass, viewport, surfaceWidth, surfaceHeight);
           }
-          // Alpha-blend the UI-only RmlUi target over the just-composited
-          // image. g_UIOverlayPipeline remaps UVs for SbS / TaB so the menu
-          // lands in each eye's half; in mono (and over the LeiaSR woven
-          // output, where the UBO mode was reset to 0) it is a plain
-          // premultiplied screen-depth blit.
-          pass.SetPipeline(webgpu::g_UIOverlayPipeline);
-          pass.SetBindGroup(0, rmlOverlayBindGroup, 0, nullptr);
+
           pass.Draw(3);
+          if (rmlOverlayBindGroup && rmlOverlay) {
+            if (wovenPresent) {
+              // The UI is a flat overlay on the swap chain, not woven content, so
+              // it keeps the aspect-correct placement it has in every other mode.
+              set_present_viewport(pass, viewport, surfaceWidth, surfaceHeight);
+            }
+            // Alpha-blend the UI-only RmlUi target over the just-composited
+            // image. g_UIOverlayPipeline remaps UVs for SbS / TaB so the menu
+            // lands in each eye's half; in mono (and over the LeiaSR woven
+            // output, where the UBO mode was reset to 0) it is a plain
+            // premultiplied screen-depth blit.
+            pass.SetPipeline(webgpu::g_UIOverlayPipeline);
+            pass.SetBindGroup(0, rmlOverlayBindGroup, 0, nullptr);
+            pass.Draw(3);
+          }
         }
         pass.End();
       }
@@ -755,6 +845,15 @@ bool aurora_stereo_mode_supported(AuroraStereoMode mode) {
     // worker's own lazy init. The real weaver/display init happens on the
     // render thread via the present path (see leiasr::try_init's contract).
     return aurora::webgpu::leiasr::is_runtime_installed();
+#else
+    return false;
+#endif
+  case AURORA_STEREO_STEAM_FRAME:
+#if defined(AURORA_ENABLE_STEAM_FRAME) && defined(AURORA_ENABLE_GX)
+    // Same contract as LeiaSR: a cheap library probe here; the context, overlay and
+    // the device's dma-buf support are set up lazily on the render thread, which
+    // presents mono until they are.
+    return aurora::webgpu::steam_frame::is_runtime_available();
 #else
     return false;
 #endif
